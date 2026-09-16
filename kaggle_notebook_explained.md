@@ -13,11 +13,16 @@ The chips were converted to PNG by `prepare_png_dataset.py`, which is what lets 
 
 This cell is prose, not code. It reads:
 
-> # Cascade Mask R-CNN on the RTS challenge — RGB baseline
+> # Cascade Mask R-CNN on the RTS challenge — vanilla RGB baseline
 >
 > Fine-tunes a COCO-pretrained **Cascade Mask R-CNN** (detectron2) on retrogressive thaw
 > slump chips, using the **red/green/blue bands only**, and writes a validated
 > `submission.json`.
+>
+> The model is the stock model-zoo R50-FPN Cascade Mask R-CNN with detectron2's default
+> augmentation. Training evaluates on val every `EVAL_PERIOD` iterations, keeps the best
+> checkpoint as `model_best.pth`, and **stops early** once `segm/AP` has not improved for
+> `EARLY_STOP_PATIENCE` evaluations.
 >
 > ### Before you run this
 >
@@ -27,7 +32,7 @@ This cell is prose, not code. It reads:
 > 2. Settings → **Accelerator: GPU**, and **Internet: On** for the first run (detectron2
 >    has to be built from source).
 > 3. Leave `SMOKE_TEST = True` for the first run. It proves the whole pipeline in about
->    fifteen minutes. Only then set it to `False` for the real ~2–3 hour run.
+>    fifteen minutes. Only then set it to `False` for the real run (at most ~2–3 hours).
 >
 > The design decisions behind every setting here are argued in
 > `detectron2_training_guide.md`.
@@ -54,50 +59,63 @@ same notebook run as a fifteen-minute correctness check or a three-hour training
 12  MAX_ITER          = 15000
 13  STEPS             = (10000, 13500)
 14  WARMUP_ITERS      = 500
-15  CHECKPOINT_PERIOD = 2000
-16  EVAL_PERIOD       = 2000
+15  CHECKPOINT_PERIOD = 1000
+16  EVAL_PERIOD       = 1000
 17  NUM_WORKERS       = 2
 18
-19  # Inference
-20  DETECTIONS_PER_IMAGE = 20
-21  SCORE_THRESH_TEST    = 0.05
-22
-23  CONFIG_YAML = "Misc/cascade_mask_rcnn_R_50_FPN_3x.yaml"
-24  OUTPUT_DIR  = "/kaggle/working/output"
-25
-26  if SMOKE_TEST:
-27      MAX_ITER, STEPS, WARMUP_ITERS = 200, (150,), 50
-28      CHECKPOINT_PERIOD = EVAL_PERIOD = 100
-29      print("SMOKE_TEST is on - short run to prove the pipeline, not a competitive model")
+19  # Early stopping - on segm/AP, which with maxDets=10 is the official ranking metric
+20  EARLY_STOP_METRIC   = "segm/AP"
+21  EARLY_STOP_PATIENCE = 3            # evaluations without a new best before stopping
+22  EARLY_STOP_START    = STEPS[0]     # never stop before the first LR drop
+23
+24  # Inference
+25  DETECTIONS_PER_IMAGE = 20
+26  SCORE_THRESH_TEST    = 0.05
+27
+28  CONFIG_YAML = "Misc/cascade_mask_rcnn_R_50_FPN_3x.yaml"
+29  OUTPUT_DIR  = "/kaggle/working/output"
 30
-31  print(f"iters={MAX_ITER}  batch={IMS_PER_BATCH}  lr={BASE_LR}")
+31  if SMOKE_TEST:
+32      MAX_ITER, STEPS, WARMUP_ITERS = 200, (150,), 50
+33      CHECKPOINT_PERIOD, EVAL_PERIOD = 100, 50
+34      EARLY_STOP_PATIENCE, EARLY_STOP_START = 1, 0     # let the stop path actually run
+35      print("SMOKE_TEST is on - short run to prove the pipeline, not a competitive model")
+36
+37  print(f"iters={MAX_ITER}  batch={IMS_PER_BATCH}  lr={BASE_LR}  "
+38        f"early stop: {EARLY_STOP_METRIC}, patience {EARLY_STOP_PATIENCE} evals "
+39        f"x {EVAL_PERIOD} iters, from iter {EARLY_STOP_START}")
 ```
 
 **Line by line**
 
 - **L1–3** — A banner comment. Everything you would want to tune is between here and the end of the cell — nothing is hidden further down.
-- **L4** — `SMOKE_TEST` is the single most useful switch in the notebook. When `True`, the block near the bottom shrinks the schedule to ~200 iterations so a complete pass — data, model, training, evaluation, submission — finishes in minutes. Run it this way **first**; discovering a broken submission writer two hours into a real run is the failure this prevents.
+- **L4** — `SMOKE_TEST` is the single most useful switch in the notebook. When `True`, the block near the bottom shrinks the schedule to ~200 iterations so a complete pass — data, model, training, evaluation, early stopping, submission — finishes in minutes. Run it this way **first**; discovering a broken submission writer two hours into a real run is the failure this prevents.
 - **L5–6** — Stage switches. Set `RUN_TRAIN = False` to re-run only inference against an existing checkpoint, which is what you want when iterating on the submission without retraining.
 - **L7** — One seed, applied to `random`, `numpy` and `torch` in cell 4. Note this makes the run *reproducible*, not deterministic — cuDNN kernel selection still varies.
 - **L8–9** — Blank line, then a comment recording the budget these numbers were chosen for. 642 is the training fold after the 15% validation split, not all 756 chips.
 - **L10** — Images per iteration. Two is what fits alongside the default 800 px resize on a 16 GB T4 with AMP on. This is the number to lower first if you hit OOM.
 - **L11** — `0.0025` is the reference `0.02` linearly rescaled from a batch of 16 to a batch of 2. Linear scaling with batch size is the standard rule; treat this as an upper bound, since fine-tuning 642 images usually wants less.
-- **L12** — Total iterations, **not epochs** — detectron2 counts iterations everywhere. At 642 images and batch 2, one epoch is 321 iterations, so 15,000 is roughly 47 epochs.
-- **L13** — The two milestones where the learning rate drops by 10×. Set at about 2/3 and 9/10 of `MAX_ITER`, mirroring the reference schedule's 60k/80k out of 90k.
+- **L12** — The iteration **ceiling**, not a target — early stopping usually ends the run before it. detectron2 counts iterations everywhere: at 642 images and batch 2 one epoch is 321 iterations, so 15,000 is roughly 47 epochs.
+- **L13** — The two milestones where the learning rate drops by 10×. Set at about 2/3 and 9/10 of `MAX_ITER`, mirroring the reference schedule's 60k/80k out of 90k. `MultiStepLR` is fixed to these iterations, so early stopping cannot move them — it can only end the run after them.
 - **L14** — Iterations spent ramping the learning rate up from near zero. With a small batch and freshly initialised heads, removing warmup is a reliable way to make the loss explode in the first hundred steps.
-- **L15** — How often a checkpoint is written. Kaggle kills a session at 12 hours regardless of progress, so this bounds how much work a dead session can cost you.
-- **L16** — How often validation runs. Each evaluation costs real time, so evaluating too often just slows training down.
+- **L15** — How often a resumable checkpoint is written. Matched to `EVAL_PERIOD`, so if a Kaggle session dies you lose at most one evaluation interval, and the early-stopping history in `early_stop.json` never runs far ahead of the weights you resume from.
+- **L16** — How often validation runs, and therefore the resolution of early stopping. Halved from the baseline's 2000, because at 2000 a patience of 3 would mean 6000 iterations — most of the run — before a stop could fire. Each evaluation of the 114 val chips costs extra time, so this is the knob to raise if training feels slow.
 - **L17** — Dataloader worker processes. Kaggle gives you few CPU cores; oversubscribing them starves the GPU rather than feeding it faster.
-- **L18–19** — Blank line and a comment separating the inference settings.
-- **L20** — How many detections the model may return per image. The official scorer uses `maxDets=10` and no training chip has more than 10 instances, so 20 is ample headroom — anything beyond the top 10 by score cannot improve the metric.
-- **L21** — Detections below this confidence are discarded. Deliberately **low**: average precision rewards recall, and low-scoring false positives are nearly free once the top-10 cut is applied. Raising this to 0.5 throws away detections the metric would have credited.
-- **L22–23** — Blank line, then the model-zoo config. `Misc/cascade_mask_rcnn_R_50_FPN_3x.yaml` is the R-50 Cascade Mask R-CNN at the 3× schedule (COCO box AP 44.3, mask AP 38.5).
-- **L24** — Checkpoints and logs go here. On Kaggle only `/kaggle/working` survives the session, so this path is not arbitrary.
-- **L25–26** — Blank line, then the smoke-test override block.
-- **L27** — Collapses the schedule to 200 iterations with a single LR drop at 150 and 50 warmup steps — enough for the loss to move, far too few to learn anything.
-- **L28** — Checkpoint and evaluate every 100 iterations, so both code paths actually execute during the short run. A smoke test that never triggers evaluation has not tested evaluation.
-- **L29** — States plainly what mode you are in. Mistaking a smoke-test checkpoint for a trained model is an easy and expensive confusion.
-- **L30–31** — Blank line, then an echo of the effective settings, so the notebook's output records what was actually run.
+- **L18–19** — Blank line, then the early-stopping block.
+- **L20** — The metric to watch, by its key in detectron2's event storage. `segm/AP` is mask AP@[.50:.95]; because the evaluator in cell 8 runs with `max_dets_per_image=10`, it is **exactly the challenge's ranking metric**, not a stock-COCO proxy for it.
+- **L21** — Patience, counted in evaluations: training stops after this many evaluations in a row fail to beat the best so far. At `EVAL_PERIOD = 1000` that is 3000 iterations without a new best. Raise it if the log shows AP still creeping up in small, noisy steps when the run stops.
+- **L22** — The earliest iteration at which stopping is allowed. In the baseline the **biggest single gain came from the LR drop at 10000** (46.1 → 51.6 AP), and AP before a drop often plateaus. Stopping on that plateau would throw away the best part of the run, so the hook keeps tracking the best checkpoint from the start but may only stop after `STEPS[0]`.
+- **L23–24** — Blank line and a comment separating the inference settings.
+- **L25** — How many detections the model may return per image. The official scorer uses `maxDets=10` and no training chip has more than 10 instances, so 20 is ample headroom — anything beyond the top 10 by score cannot improve the metric.
+- **L26** — Detections below this confidence are discarded. Deliberately **low**: average precision rewards recall, and low-scoring false positives are nearly free once the top-10 cut is applied. Raising this to 0.5 throws away detections the metric would have credited.
+- **L27–28** — Blank line, then the model-zoo config. `Misc/cascade_mask_rcnn_R_50_FPN_3x.yaml` is the vanilla R-50-FPN Cascade Mask R-CNN at the 3× schedule (COCO box AP 44.3, mask AP 38.5).
+- **L29** — Checkpoints and logs go here. On Kaggle only `/kaggle/working` survives the session, so this path is not arbitrary.
+- **L30–31** — Blank line, then the smoke-test override block.
+- **L32** — Collapses the schedule to 200 iterations with a single LR drop at 150 and 50 warmup steps — enough for the loss to move, far too few to learn anything.
+- **L33** — Checkpoint every 100 iterations and evaluate every 50, so both code paths actually execute during the short run. A smoke test that never triggers evaluation has not tested evaluation.
+- **L34** — Patience 1 and no start delay, so the early-stopping hook gets real chances to fire in the short run. It still only stops if AP fails to improve between two evaluations, so a smoke test that runs to 200 is not a failure.
+- **L35** — States plainly what mode you are in. Mistaking a smoke-test checkpoint for a trained model is an easy and expensive confusion.
+- **L36–39** — Blank line, then an echo of the effective settings, so the notebook's output records what was actually run.
 
 
 ## Cell 3 — Environment and detectron2 install
@@ -165,22 +183,22 @@ Pulls in everything the rest of the notebook uses, fixes the random seeds, and f
 ```python
  1  import csv
  2  import json
- 3  import os
- 4  import random
- 5  from pathlib import Path
- 6
- 7  import cv2
- 8  import matplotlib.pyplot as plt
- 9  from pycocotools import mask as mask_utils
-10  from pycocotools.coco import COCO
-11  from pycocotools.cocoeval import COCOeval
-12
-13  from detectron2 import model_zoo
-14  from detectron2.checkpoint import DetectionCheckpointer
-15  from detectron2.config import get_cfg
-16  from detectron2.data import (DatasetCatalog, DatasetMapper, MetadataCatalog,
-17                               build_detection_test_loader,
-18                               build_detection_train_loader)
+ 3  import logging
+ 4  import os
+ 5  import random
+ 6  from pathlib import Path
+ 7
+ 8  import cv2
+ 9  import matplotlib.pyplot as plt
+10  from pycocotools import mask as mask_utils
+11  from pycocotools.coco import COCO
+12  from pycocotools.cocoeval import COCOeval
+13
+14  from detectron2 import model_zoo
+15  from detectron2.checkpoint import DetectionCheckpointer
+16  from detectron2.config import get_cfg
+17  from detectron2.data import (DatasetCatalog, DatasetMapper, MetadataCatalog,
+18                               build_detection_test_loader)
 19  from detectron2.data import transforms as T
 20  from detectron2.data.datasets import register_coco_instances
 21  from detectron2.engine import DefaultTrainer, HookBase
@@ -215,30 +233,30 @@ Pulls in everything the rest of the notebook uses, fixes the random seeds, and f
 
 **Line by line**
 
-- **L1–5** — Standard library: `csv` reads the test manifest, `json` reads and writes COCO files, `os` joins output paths, `random` is seeded below, `Path` is used for every filesystem operation in the notebook.
-- **L6–7** — Blank line, then OpenCV — used to read PNGs for the sanity check. detectron2 uses it internally too.
-- **L8** — matplotlib, only for displaying the sanity-check figure.
-- **L9–11** — pycocotools, three separate entry points: `mask_utils` encodes and decodes RLE, `COCO` loads a ground-truth file, `COCOeval` computes average precision. The last two are what let us reproduce the challenge's exact metric locally.
-- **L12–13** — Blank line, then `model_zoo`, which resolves a config name to both a YAML path and a pretrained-checkpoint URL.
-- **L14** — `DetectionCheckpointer` loads weights into a model built outside the trainer — needed for the inference-only path.
-- **L15** — `get_cfg()` returns a fresh config populated with detectron2's defaults.
-- **L16–19** — The data API. `DatasetCatalog`/`MetadataCatalog` are the registries; `DatasetMapper` is the built-in mapper we can now use unchanged because the images are PNGs; the two loader builders turn a registered dataset into a torch `DataLoader`.
-- **L20** — The augmentation module, aliased `T` by convention.
-- **L21** — `register_coco_instances` is the function that makes the whole data layer three lines instead of a hundred.
-- **L22** — `DefaultTrainer` supplies the training loop; `HookBase` is the base class for the validation-loss hook in cell 7.
-- **L23** — `COCOEvaluator` gives cheap in-loop metrics. Note these are *stock COCO* numbers, not this challenge's — cell 9 handles the official metric.
-- **L24** — `build_model` constructs a model from a config without a trainer, used by the inference path.
-- **L25** — `setup_logger` makes detectron2's internal logging visible; without it, useful messages such as checkpoint shape mismatches are swallowed.
-- **L26** — `Visualizer` draws ground-truth and predicted masks over an image.
-- **L27–28** — Blank line, then activate detectron2's logger.
-- **L29–31** — Seed all three generators. `torch.manual_seed` covers CUDA too. This makes runs comparable; it does not make them bit-identical, since cuDNN still picks kernels non-deterministically.
-- **L32–34** — Blank lines, then the data locator.
-- **L35** — Its docstring: the search is anchored on the annotations file rather than on a directory name, so it works no matter what Kaggle names the attached dataset folder.
-- **L36** — Two search roots: the Kaggle input mount first, then the current directory for local runs.
-- **L37–39** — Skip a root that does not exist — `/kaggle/input` is absent when running locally, and globbing it would simply find nothing.
-- **L40–41** — Recursively search for `annotations/instances_train_fold.json` and return the directory two levels above it, which is `data_png/`. `sorted` keeps the choice stable when several copies are attached.
-- **L42–45** — If nothing matched, fail immediately with an actionable message. A missing dataset should stop the notebook here, not surface as a confusing error inside the dataloader.
-- **L46–48** — Blank lines, then resolve the path once and print it, so the notebook's output records which copy of the data was used.
+- **L1–6** — Standard library: `csv` reads the test manifest, `json` reads and writes COCO files and the early-stopping state, `logging` lets the early-stopping hook write into detectron2's log, `os` joins output paths, `random` is seeded below, `Path` is used for every filesystem operation in the notebook.
+- **L7–8** — Blank line, then OpenCV — used to read PNGs for the sanity check. detectron2 uses it internally too.
+- **L9** — matplotlib, only for displaying the sanity-check figure.
+- **L10–12** — pycocotools, three separate entry points: `mask_utils` encodes, decodes and intersects RLE masks, `COCO` loads a ground-truth file, `COCOeval` computes average precision. Together they reproduce the challenge's exact metric locally, plus the mask-IoU numbers in cell 11.
+- **L13–14** — Blank line, then `model_zoo`, which resolves a config name to both a YAML path and a pretrained-checkpoint URL.
+- **L15** — `DetectionCheckpointer` loads weights into a model built outside the trainer — needed for the inference-only path.
+- **L16** — `get_cfg()` returns a fresh config populated with detectron2's defaults.
+- **L17–18** — The data API. `DatasetCatalog`/`MetadataCatalog` are the registries; `DatasetMapper` is the built-in mapper we can use unchanged because the images are PNGs; `build_detection_test_loader` turns a dataset into a single-pass `DataLoader`. There is no `build_detection_train_loader` import any more: the vanilla run uses `DefaultTrainer`'s own training loader.
+- **L19** — The augmentation module, aliased `T` by convention. Now only needed for the deterministic resize in the validation-loss loader.
+- **L20** — `register_coco_instances` is the function that makes the whole data layer three lines instead of a hundred.
+- **L21** — `DefaultTrainer` supplies the training loop; `HookBase` is the base class for the validation-loss and early-stopping hooks in cell 8.
+- **L22** — `COCOEvaluator` computes the in-loop metrics that early stopping reads.
+- **L23** — `build_model` constructs a model from a config without a trainer, used by the inference path.
+- **L24** — `setup_logger` makes detectron2's internal logging visible; without it, useful messages such as checkpoint shape mismatches — and the early-stopping progress lines — are swallowed.
+- **L25** — `Visualizer` draws ground-truth and predicted masks over an image.
+- **L26–27** — Blank line, then activate detectron2's logger.
+- **L28–30** — Seed all three generators. `torch.manual_seed` covers CUDA too. This makes runs comparable; it does not make them bit-identical, since cuDNN still picks kernels non-deterministically.
+- **L31–33** — Blank lines, then the data locator.
+- **L34** — Its docstring: the search is anchored on the annotations file rather than on a directory name, so it works no matter what Kaggle names the attached dataset folder.
+- **L35** — Two search roots: the Kaggle input mount first, then the current directory for local runs.
+- **L36–38** — Skip a root that does not exist — `/kaggle/input` is absent when running locally.
+- **L39–40** — Recursively search for `annotations/instances_train_fold.json` and return the directory two levels above it, which is `data_png/`. `sorted` keeps the choice stable when several copies are attached.
+- **L41–44** — If nothing matched, fail immediately with an actionable message. A missing dataset should stop the notebook here, not surface as a confusing error inside the dataloader.
+- **L45–48** — Blank lines, then resolve the path once and print it, so the notebook's output records which copy of the data was used.
 
 
 ## Cell 5 — Registering the datasets
@@ -341,8 +359,8 @@ during training cost a GPU session. Run this before you ever set `RUN_TRAIN = Tr
 
 ## Cell 7 — Building the config
 
-Turns the model-zoo Cascade Mask R-CNN config into one adapted to this dataset. Only a
-handful of keys change; the comments record which defaults were deliberately *kept*, which
+Turns the model-zoo Cascade Mask R-CNN config into one adapted to this dataset. The model
+stays vanilla — only dataset, solver and test-time keys change; the comments record which defaults were deliberately *kept*, which
 matters as much as the overrides.
 
 ```python
@@ -395,7 +413,7 @@ matters as much as the overrides.
 - **L3** — Overlay the Cascade Mask R-CNN YAML. `get_config_file` resolves the name to a path inside the installed package, so no manual downloading.
 - **L4** — The matching COCO-pretrained weights, as a URL. **On an offline Kaggle run this download fails** — pre-fetch the checkpoint into your attached dataset and point this at the local file instead.
 - **L5–6** — Blank line, then the training dataset. It must be a **tuple** — a bare string would be read as a sequence of characters.
-- **L7** — The dataset used by the periodic evaluation.
+- **L7** — The dataset used by the periodic evaluation — and therefore the one early stopping selects on.
 - **L8** — Dataloader workers, from cell 2.
 - **L9–10** — Blank line, then the single most important override: one class. Cascade R-CNN has **three** sequential box heads (at IoU 0.5/0.6/0.7) and this value propagates to all of them — which is why hand-rolled 'replace the final layer' recipes written for plain Mask R-CNN break on Cascade.
 - **L11** — **Must be `bitmask`.** The default is `polygon`, which cannot handle the RLE dict segmentations these labels use. This is the classic cause of 'loss falls but mask AP stays at zero'.
@@ -406,7 +424,7 @@ matters as much as the overrides.
 - **L17** — Warmup length.
 - **L18** — Checkpoint frequency.
 - **L19** — Enable automatic mixed precision. Roughly halves activation memory on a T4 and is close to free in accuracy — turn this on before considering a smaller input size.
-- **L20** — Evaluation frequency.
+- **L20** — Evaluation frequency, which is also how often early stopping gets to decide.
 - **L21–22** — Blank line, then the test-time score floor, kept low so average precision can use the low-confidence tail.
 - **L23** — Maximum detections returned per image.
 - **L24–29** — A comment block recording the defaults that were kept **on purpose**, which is easy to lose track of later. `INPUT.FORMAT` stays `BGR` so `read_image` flips our RGB PNGs to match the COCO `PIXEL_MEAN` ordering; the resize stays large because it lifts these ~150–300 px chips into the size range the pretrained weights were trained on; and the anchors stay put because at that ~4.2× upsampling the instances span roughly 30–400 px, which is exactly the `32/64/128/256/512` ladder. The last line is the trap: resize and anchors are **one coupled decision**, so lowering the resize without shrinking the anchors collapses recall.
@@ -421,111 +439,176 @@ matters as much as the overrides.
 > **Watch out.** `INPUT.MASK_FORMAT = "bitmask"` here and RLE labels in the JSON must agree. Everything trains normally if they do not — the loss decreases — and mask AP simply never rises.
 
 
-## Cell 8 — Trainer and the validation-loss hook
+## Cell 8 — Trainer, validation loss and early stopping
 
-`DefaultTrainer` supplies the loop, scheduler, checkpointing and logging. Three overrides
-adapt it to this dataset, and one hook adds the validation-loss curve that `DefaultTrainer`
-does not compute on its own — the main signal for overfitting on only 642 images.
+`DefaultTrainer` supplies the loop, scheduler, checkpointing and logging. This cell keeps the
+model and its training augmentation **vanilla**, and adds two hooks: one that computes the
+validation loss `DefaultTrainer` never reports, and one that keeps the best checkpoint and ends
+the run once validation AP stops improving — on 642 training images, overfitting (not the
+iteration budget) is what limits this model.
 
 ```python
- 1  TRAIN_AUGS = [
- 2      T.ResizeShortestEdge(cfg.INPUT.MIN_SIZE_TRAIN, cfg.INPUT.MAX_SIZE_TRAIN, "choice"),
- 3      T.RandomFlip(horizontal=True, vertical=False),
- 4      T.RandomFlip(horizontal=False, vertical=True),
- 5  ]
- 6
- 7
- 8  class LossEvalHook(HookBase):
- 9      """Periodically report the validation loss - DefaultTrainer never does."""
-10
-11      def __init__(self, period, model, loader):
-12          self._period = period
-13          self._model = model
-14          self._loader = loader
-15
-16      def _do_loss_eval(self):
-17          was_training = self._model.training
-18          self._model.train()
-19          totals, n = {}, 0
-20          with torch.no_grad():
-21              for batch in self._loader:
-22                  for k, v in self._model(batch).items():
-23                      totals[k] = totals.get(k, 0.0) + float(v)
-24                  n += 1
-25          self._model.train(was_training)
-26          means = {f"val_{k}": v / max(n, 1) for k, v in totals.items()}
-27          self.trainer.storage.put_scalars(val_total_loss=sum(means.values()), **means)
-28
-29      def after_step(self):
-30          nxt = self.trainer.iter + 1
-31          if self._period > 0 and nxt % self._period == 0 and nxt != self.trainer.max_iter:
-32              self._do_loss_eval()
-33
-34
-35  class RTSTrainer(DefaultTrainer):
-36      @classmethod
-37      def build_train_loader(cls, cfg):
-38          mapper = DatasetMapper(cfg, is_train=True, augmentations=TRAIN_AUGS)
-39          return build_detection_train_loader(cfg, mapper=mapper)
-40
-41      @classmethod
-42      def build_test_loader(cls, cfg, dataset_name):
-43          return build_detection_test_loader(
-44              cfg, dataset_name, mapper=DatasetMapper(cfg, is_train=False))
-45
-46      @classmethod
-47      def build_evaluator(cls, cfg, dataset_name, output_folder=None):
-48          return COCOEvaluator(dataset_name, output_dir=output_folder or cfg.OUTPUT_DIR)
-49
-50      def build_hooks(self):
-51          hooks = super().build_hooks()
-52          loss_loader = build_detection_test_loader(
-53              self.cfg, self.cfg.DATASETS.TEST[0],
-54              mapper=DatasetMapper(self.cfg, is_train=True, augmentations=[
-55                  T.ResizeShortestEdge(self.cfg.INPUT.MIN_SIZE_TEST,
-56                                       self.cfg.INPUT.MAX_SIZE_TEST)]))
-57          hooks.insert(-1, LossEvalHook(self.cfg.TEST.EVAL_PERIOD, self.model, loss_loader))
-58          return hooks
+  1  class LossEvalHook(HookBase):
+  2      """Periodically report the validation loss - DefaultTrainer never does."""
+  3
+  4      def __init__(self, period, model, loader):
+  5          self._period = period
+  6          self._model = model
+  7          self._loader = loader
+  8
+  9      def _do_loss_eval(self):
+ 10          was_training = self._model.training
+ 11          self._model.train()
+ 12          totals, n = {}, 0
+ 13          with torch.no_grad():
+ 14              for batch in self._loader:
+ 15                  for k, v in self._model(batch).items():
+ 16                      totals[k] = totals.get(k, 0.0) + float(v)
+ 17                  n += 1
+ 18          self._model.train(was_training)
+ 19          means = {f"val_{k}": v / max(n, 1) for k, v in totals.items()}
+ 20          self.trainer.storage.put_scalars(val_total_loss=sum(means.values()), **means)
+ 21
+ 22      def after_step(self):
+ 23          nxt = self.trainer.iter + 1
+ 24          if self._period > 0 and nxt % self._period == 0 and nxt != self.trainer.max_iter:
+ 25              self._do_loss_eval()
+ 26
+ 27
+ 28  class EarlyStopping(Exception):
+ 29      """Raised by EarlyStoppingHook to end training before MAX_ITER."""
+ 30
+ 31
+ 32  def best_iteration(history):
+ 33      """Iteration (str key) with the highest score; ties go to the earliest."""
+ 34      return max(history, key=lambda k: (history[k], -int(k)))
+ 35
+ 36
+ 37  class EarlyStoppingHook(HookBase):
+ 38      """Save model_best.pth on `metric`; stop after `patience` evals with no new best.
+ 39
+ 40      Must run after EvalHook, whose result it reads from event storage. The per-eval
+ 41      history lives in early_stop.json, so a resumed Kaggle session keeps counting
+ 42      instead of starting over. model_best.pth is written with torch.save rather than
+ 43      the trainer's checkpointer, which would repoint `last_checkpoint` at it.
+ 44      """
+ 45
+ 46      def __init__(self, metric, patience, start_iter, output_dir):
+ 47          self._metric = metric
+ 48          self._patience = patience
+ 49          self._start_iter = start_iter
+ 50          self._state_path = Path(output_dir) / "early_stop.json"
+ 51          self._best_path = Path(output_dir) / "model_best.pth"
+ 52          self.state = {"history": {}, "stopped_at": None}
+ 53          if self._state_path.exists():
+ 54              self.state = json.loads(self._state_path.read_text())
+ 55
+ 56      def _check(self):
+ 57          """Record a fresh evaluation. Returns True once patience has run out."""
+ 58          latest = self.trainer.storage.latest().get(self._metric)
+ 59          if latest is None or latest[1] != self.trainer.storage.iter:
+ 60              return False                                  # no evaluation this step
+ 61          value, it = float(latest[0]), int(latest[1])
+ 62          hist = self.state["history"]
+ 63          hist[str(it)] = value if np.isfinite(value) else -1.0
+ 64
+ 65          best_it = best_iteration(hist)
+ 66          if best_it == str(it):
+ 67              model = getattr(self.trainer.model, "module", self.trainer.model)
+ 68              torch.save({"model": model.state_dict(), "iteration": it}, self._best_path)
+ 69          stale = sum(int(k) > int(best_it) for k in hist)
+ 70          self._state_path.write_text(json.dumps(self.state, indent=1))
+ 71
+ 72          logging.getLogger("detectron2").info(
+ 73              f"early stopping: {self._metric}={value:.2f} @ {it}, best {hist[best_it]:.2f} "
+ 74              f"@ {best_it}, {stale}/{self._patience} evals without a new best")
+ 75          return stale >= self._patience and it + 1 >= self._start_iter
+ 76
+ 77      def after_step(self):
+ 78          if self._check():
+ 79              self.state["stopped_at"] = self.trainer.iter
+ 80              self._state_path.write_text(json.dumps(self.state, indent=1))
+ 81              raise EarlyStopping(
+ 82                  f"early stop at iter {self.trainer.iter + 1}: no new best {self._metric} "
+ 83                  f"in {self._patience} evaluations")
+ 84
+ 85      def after_train(self):
+ 86          if self.trainer.iter + 1 >= self.trainer.max_iter:   # ran to MAX_ITER
+ 87              self._check()                                     # score the final eval too
+ 88
+ 89
+ 90  class RTSTrainer(DefaultTrainer):
+ 91      # build_train_loader is deliberately not overridden: vanilla DatasetMapper
+ 92      # augmentation (ResizeShortestEdge over INPUT.MIN_SIZE_TRAIN + horizontal flip).
+ 93
+ 94      @classmethod
+ 95      def build_test_loader(cls, cfg, dataset_name):
+ 96          return build_detection_test_loader(
+ 97              cfg, dataset_name, mapper=DatasetMapper(cfg, is_train=False))
+ 98
+ 99      @classmethod
+100      def build_evaluator(cls, cfg, dataset_name, output_folder=None):
+101          # max_dets_per_image=10 makes segm AP, AP50 and AP75 the official numbers.
+102          # APs/APm/APl here still use COCO's area bins - cell 11 has the official ones.
+103          return COCOEvaluator(dataset_name, output_dir=output_folder or cfg.OUTPUT_DIR,
+104                               max_dets_per_image=10)
+105
+106      def build_hooks(self):
+107          hooks = super().build_hooks()
+108          loss_loader = build_detection_test_loader(
+109              self.cfg, self.cfg.DATASETS.TEST[0],
+110              mapper=DatasetMapper(self.cfg, is_train=True, augmentations=[
+111                  T.ResizeShortestEdge(self.cfg.INPUT.MIN_SIZE_TEST,
+112                                       self.cfg.INPUT.MAX_SIZE_TEST)]))
+113          # Both go just before PeriodicWriter, and so after EvalHook.
+114          hooks.insert(-1, LossEvalHook(self.cfg.TEST.EVAL_PERIOD, self.model, loss_loader))
+115          hooks.insert(-1, EarlyStoppingHook(EARLY_STOP_METRIC, EARLY_STOP_PATIENCE,
+116                                             EARLY_STOP_START, self.cfg.OUTPUT_DIR))
+117          return hooks
 ```
 
 **Line by line**
 
-- **L1** — The training augmentation list, passed to the built-in mapper below.
-- **L2** — Resize the short edge to one of `MIN_SIZE_TRAIN`'s six values, chosen at random (`"choice"`). This is multi-scale training, and it is also what performs the ~4.2× upsampling these small chips need.
-- **L3–4** — Horizontal and vertical flips as two separate augmentations, each applied independently with probability 0.5. **Vertical flips are legitimate here** in a way they are not for ordinary photographs: nadir satellite imagery has no canonical 'up', so this is a free doubling of augmentation strength. (It would need reconsidering if you later add band 5, shaded relief, whose illumination direction *is* meaningful.)
-- **L5** — Close the list.
-- **L6–8** — Blank lines, then the hook class. `HookBase` gives access to `self.trainer` once registered.
-- **L9** — Docstring stating why it exists — `DefaultTrainer` runs metric evaluation on a schedule but never computes a validation *loss*, and loss is the earliest overfitting signal.
-- **L10–14** — Blank line, then the constructor: store the evaluation period, the model and the validation loader. Nothing heavy happens here — the loader is built once by the caller and reused every time the hook fires.
-- **L15–16** — Blank line, then the evaluation body.
-- **L17** — Remember whether the model was in training mode, so it can be restored exactly.
-- **L18** — **Switch to train mode deliberately.** A detectron2 model returns a dict of losses in train mode and a list of predictions in eval mode. We want losses, so train mode it is — `torch.no_grad()` below is what prevents this from actually updating anything.
-- **L19** — Accumulators for the loss totals and the batch count.
-- **L20** — No gradients: this is measurement, not learning. Without it, memory balloons and the graph is retained.
-- **L21** — Iterate the whole validation fold.
-- **L22–23** — Call the model and accumulate each loss component by name (classification, box regression, mask, RPN).
-- **L24** — Count batches for the mean.
-- **L25** — Restore the model's previous mode. Leaving it in train mode would silently corrupt the next evaluation.
-- **L26** — Average each component and prefix with `val_` so the keys do not collide with training losses in the logs.
-- **L27** — Write to detectron2's event storage, adding a `val_total_loss` summary alongside the components. Anything put here shows up in the printed metrics and in TensorBoard.
-- **L28–29** — Blank line, then the hook callback that detectron2 calls after every iteration.
-- **L30** — Use `iter + 1` because `trainer.iter` is zero-based.
-- **L31–32** — Fire only on the period, and skip the final iteration — the trainer runs its own evaluation there, and doing both just duplicates work.
-- **L33–35** — Blank lines, then the trainer subclass.
-- **L36–37** — Override the training loader. This is the entire integration point for augmentation.
-- **L38** — The **built-in** `DatasetMapper`, with our augmentation list substituted. Passing `augmentations` as a keyword works because detectron2's `@configurable` decorator forwards kwargs its `from_config` does not recognise straight to `__init__`, overriding the cfg-derived value. No custom mapper class is needed — that was only required to read `.npz` files.
-- **L39** — Build the loader. `mapper` is keyword-only.
-- **L40–41** — Blank line, then the next `@classmethod` decorator.
-- **L42** — The test-loader override.
-- **L43–44** — The same built-in mapper with `is_train=False`: deterministic resize, no flips, and no ground-truth instances.
-- **L45–46** — Blank line, then the next `@classmethod` decorator.
-- **L47** — The evaluator override.
-- **L48** — `COCOEvaluator` for in-loop monitoring. Remember these are **stock COCO** numbers — different area bins and `maxDets` from this challenge's scorer — so watch the trend, not the absolute value. Cell 11 computes the real metric.
-- **L49–50** — Blank line, then hook registration.
-- **L51** — Start from `DefaultTrainer`'s own hooks (checkpointing, LR scheduling, metric writing) rather than replacing them.
-- **L52–56** — Build the loader for validation loss. **The subtlety: `is_train=True`.** The ordinary test loader's mapper produces no ground-truth instances, so the model could not compute a loss from it. We need training-style targets but deterministic geometry, so it is a *test* loader (no shuffling, single pass) with a *train* mapper restricted to a plain deterministic resize.
-- **L57** — Insert the hook at position `-1`, immediately **before** the periodic writer. Append it instead and the writer runs first, so each validation loss is logged one interval late.
-- **L58** — Return the augmented hook list.
+- **L1–2** — The validation-loss hook. `HookBase` gives access to `self.trainer` once registered. `DefaultTrainer` runs metric evaluation on a schedule but never computes a validation *loss*, and loss is the earliest overfitting signal.
+- **L3–7** — Blank line, then the constructor: store the evaluation period, the model and the validation loader. Nothing heavy happens here — the loader is built once by the caller and reused every time the hook fires.
+- **L8–9** — Blank line, then the evaluation body.
+- **L10** — Remember whether the model was in training mode, so it can be restored exactly.
+- **L11** — **Switch to train mode deliberately.** A detectron2 model returns a dict of losses in train mode and a list of predictions in eval mode. We want losses, so train mode it is — `torch.no_grad()` below is what prevents this from actually updating anything.
+- **L12** — Accumulators for the loss totals and the batch count.
+- **L13** — No gradients: this is measurement, not learning. Without it, memory balloons and the graph is retained.
+- **L14–17** — Iterate the whole validation fold, accumulate each loss component by name (classification, box regression, mask, RPN) and count batches for the mean.
+- **L18** — Restore the model's previous mode. Leaving it in train mode would silently corrupt the next evaluation.
+- **L19** — Average each component and prefix with `val_` so the keys do not collide with training losses in the logs.
+- **L20** — Write to detectron2's event storage, adding a `val_total_loss` summary alongside the components. Anything put here shows up in the printed metrics and in TensorBoard.
+- **L21–25** — The callback detectron2 calls after every iteration. `iter + 1` because `trainer.iter` is zero-based; fire only on the period and skip the final iteration, which only duplicates the trainer's own end-of-run evaluation.
+- **L26–29** — Blank lines, then a dedicated exception type. detectron2's loop is a plain `for self.iter in range(start_iter, max_iter)`, so there is no flag a hook can set to leave it — raising is the only clean exit, and a named type lets cell 9 catch *this* exception without swallowing real crashes.
+- **L30–34** — A helper shared with cell 9: the iteration with the highest score. The sort key `(score, -iteration)` breaks ties toward the **earliest** iteration, so an equal score later on neither overwrites `model_best.pth` nor resets the patience count.
+- **L35–44** — The early-stopping hook and its docstring, which records the two design constraints explained below.
+- **L45–46** — Blank line, then the constructor arguments: the metric key, patience in evaluations, the earliest iteration at which stopping is allowed, and the output directory.
+- **L47–51** — Store them and derive the two files this hook owns: `early_stop.json` (state) and `model_best.pth` (weights).
+- **L52–54** — Fresh state, **unless `early_stop.json` already exists** — which is the resume case. Kaggle kills sessions; `resume_or_load(resume=True)` restores the weights, optimizer and iteration counter, but a hook's in-memory counters would restart from nothing. Reloading the history from disk is what lets patience keep counting across sessions. (detectron2's built-in `BestCheckpointer` has exactly this gap, which is one reason it is not used.)
+- **L55–57** — Blank line, then `_check`, records one evaluation and reports whether patience has run out.
+- **L58** — Read the most recent value of the metric. `storage.latest()` maps each key to `(value, iteration)`.
+- **L59–60** — **The freshness test.** `latest()` returns the last value ever written, so on the 999 iterations between evaluations it would hand back a stale score. Only when the value's iteration equals the current storage iteration did `EvalHook` just write it. This also covers an evaluation that produced nothing (for instance zero predictions early in training, when `COCOEvaluator` returns no `segm` results).
+- **L61** — Unpack as plain Python types, so they serialise to JSON.
+- **L62–63** — Record the score under its iteration. Keying by iteration (as a string — JSON keys must be strings) makes a re-run evaluation after a resume **overwrite** its earlier entry instead of being counted twice. A `NaN` score is stored as `-1`, so it can never become the best.
+- **L64–65** — Blank line, then find the best iteration across the whole history.
+- **L66–68** — If this evaluation *is* the best, save its weights. Two deliberate choices. First, `torch.save` of `{"model": state_dict}` rather than `trainer.checkpointer.save`: the checkpointer rewrites the `last_checkpoint` pointer on every save, so a resume would restart from the best iteration instead of the latest one. The `{"model": ...}` layout is what `DetectionCheckpointer.load` expects, so cell 10 loads it like any other checkpoint. Second, `getattr(..., "module", ...)` unwraps a `DistributedDataParallel` model if there is one, so the saved keys have no `module.` prefix.
+- **L69** — Patience is counted, not incremented: the number of evaluations **after** the best one. Deriving it from the history each time is what keeps it correct after a resume, where evaluations may be repeated.
+- **L70** — Persist the state after every evaluation.
+- **L71–74** — Blank line, then one progress line per evaluation in detectron2's log, so you can watch the count approach the patience.
+- **L75** — Stop only when both conditions hold: patience has run out **and** the run is past `EARLY_STOP_START`. Before that point the best checkpoint is still tracked — it just cannot end the run.
+- **L76–83** — After each iteration, run the check; on a stop, record the iteration in `early_stop.json` and raise. The `stopped_at` marker is what stops cell 9 from resuming a finished run.
+- **L84–87** — `after_train` runs in a `finally` block after the loop, whether it completed or raised. `EvalHook` does its final evaluation there at `MAX_ITER`, so this hook scores that evaluation too — otherwise the last 1000 iterations could never produce `model_best.pth`. After an early stop, `iter + 1 < max_iter`, so nothing happens.
+- **L88–92** — The trainer subclass. `build_train_loader` is **not overridden**, which is what "vanilla" means here: `DefaultTrainer` builds the stock `DatasetMapper(cfg, is_train=True)`, whose augmentation is `ResizeShortestEdge` over `INPUT.MIN_SIZE_TRAIN` plus a random horizontal flip. The baseline's extra vertical flip is gone. The mapper still reads `INPUT.MASK_FORMAT = "bitmask"` from the config, so the RLE labels are handled as before.
+- **L93–97** — The test-loader override: the same built-in mapper with `is_train=False`, meaning deterministic resize, no flips, and no ground-truth instances.
+- **L98–104** — The evaluator. **`max_dets_per_image=10` is the important argument.** detectron2 expands it to COCO `maxDets=[1, 10, 10]` and then reports AP at the last entry, so `segm/AP`, `AP50` and `AP75` become the challenge's own numbers — the stock `[1, 10, 100]` would let up to 20 detections per image count. The `all` area range is identical to the official one. Only `APs`/`APm`/`APl` still use COCO's area bins (32² and 96², not 300 and 2000), so read those from cell 11 instead.
+- **L105–107** — Hook registration, starting from `DefaultTrainer`'s own list: timer, LR scheduler, periodic checkpointer, `EvalHook`, and `PeriodicWriter` last.
+- **L108–112** — Build the loader for validation loss. **The subtlety: `is_train=True`.** The ordinary test loader's mapper produces no ground-truth instances, so the model could not compute a loss from it. We need training-style targets but deterministic geometry, so it is a *test* loader (no shuffling, single pass) with a *train* mapper restricted to a plain resize.
+- **L113–116** — Insert both hooks at `-1`, immediately **before** `PeriodicWriter`. Hooks run in list order, so this places them after `EvalHook` — the early-stopping hook must run *after* the evaluation it reads, or it would always see the previous one — and before the writer, so their values are logged in the same interval.
+- **L117** — Return the hook list.
+
+> **Watch out.** Early stopping selects `model_best.pth` using the val fold, so that checkpoint's val AP is a slightly **optimistic** estimate — it is the best of up to 15 looks at the same 114 chips. Comparing two runs on val is still fair; the test leaderboard is the unbiased number.
 
 
 ## Cell 9 — Train
@@ -534,25 +617,45 @@ The whole training run. Short, because everything was arranged in the cells abov
 resumable, because Kaggle will kill the session at twelve hours regardless of progress.
 
 ```python
-1  if RUN_TRAIN:
-2      trainer = RTSTrainer(cfg)
-3      trainer.resume_or_load(resume=True)
-4      trainer.train()
-5      print("training finished ->", os.path.join(cfg.OUTPUT_DIR, "model_final.pth"))
-6  else:
-7      print("RUN_TRAIN is False - skipping training")
+ 1  stop_file = Path(OUTPUT_DIR) / "early_stop.json"
+ 2  already_stopped = (stop_file.exists()
+ 3                     and json.loads(stop_file.read_text()).get("stopped_at") is not None)
+ 4
+ 5  if not RUN_TRAIN:
+ 6      print("RUN_TRAIN is False - skipping training")
+ 7  elif already_stopped:
+ 8      print(f"this run already early-stopped ({stop_file}) - "
+ 9            f"clear {OUTPUT_DIR} to start a new one")
+10  else:
+11      trainer = RTSTrainer(cfg)
+12      trainer.resume_or_load(resume=True)
+13      try:
+14          trainer.train()
+15          print("training ran to MAX_ITER ->", os.path.join(cfg.OUTPUT_DIR, "model_final.pth"))
+16      except EarlyStopping as e:
+17          # detectron2 logs this as "Exception during training" first - that is expected.
+18          print(e)
+19
+20  if stop_file.exists():
+21      hist = json.loads(stop_file.read_text())["history"]
+22      best_it = best_iteration(hist)
+23      print(f"best {EARLY_STOP_METRIC} = {hist[best_it]:.2f} at iter {best_it} "
+24            f"-> {os.path.join(OUTPUT_DIR, 'model_best.pth')}")
 ```
 
 **Line by line**
 
-- **L1** — Guarded by the stage switch, so you can re-run the notebook for inference alone.
-- **L2** — Construct the trainer. This builds the model, loads `cfg.MODEL.WEIGHTS`, and constructs the optimizer, scheduler and dataloaders. **Watch the log here**: it lists checkpoint tensors that were skipped on a shape mismatch. Skips on the final class predictors are expected and correct — the COCO checkpoint has 81 classes and this model has 2. Anything *else* being skipped is a bug worth chasing.
-- **L3** — `resume=True` is what makes chained Kaggle sessions work: if `OUTPUT_DIR` holds a `last_checkpoint`, it restores the weights **and** the iteration counter and optimizer state. With `resume=False` it would load the pretrained weights and restart from iteration 0 — the difference between continuing a run and silently starting over.
-- **L4** — Run the loop to `MAX_ITER`.
-- **L5** — Report where the final weights landed.
-- **L6–7** — The skip branch, which prints rather than staying silent so the notebook's output is unambiguous about what ran.
+- **L1** — The state file written by the early-stopping hook.
+- **L2–3** — Has this output directory already **finished** by early stopping? Without this check, re-running the cell would call `resume_or_load(resume=True)`, pick up the last periodic checkpoint, and quietly start training again from where the run was stopped.
+- **L4–6** — Blank line, then the stage switch, so you can re-run the notebook for inference alone.
+- **L7–9** — A finished run is left alone, with instructions to clear the output directory to start a fresh one. This also catches the easy mistake of flipping `SMOKE_TEST` off in a session whose `/kaggle/working/output` still holds the smoke test.
+- **L10–11** — Construct the trainer. This builds the model, loads `cfg.MODEL.WEIGHTS`, and constructs the optimizer, scheduler, dataloaders and hooks. **Watch the log here**: it lists checkpoint tensors that were skipped on a shape mismatch. Skips on the final class predictors are expected and correct — the COCO checkpoint has 81 classes and this model has 2. Anything *else* being skipped is a bug worth chasing.
+- **L12** — `resume=True` is what makes chained Kaggle sessions work: if `OUTPUT_DIR` holds a `last_checkpoint`, it restores the weights **and** the iteration counter and optimizer state, and the early-stopping hook reloads its history from `early_stop.json`. With `resume=False` it would load the pretrained weights and restart from iteration 0.
+- **L13–15** — Train. If this returns normally, the run reached `MAX_ITER` without triggering early stopping.
+- **L16–18** — Early stopping arrives as the `EarlyStopping` exception. detectron2's loop logs any exception with a full traceback (`Exception during training:`) before re-raising it, so **that traceback is expected** — this `except` is what turns it into a normal end of training. Any other exception still propagates.
+- **L19–24** — Blank line, then report the best evaluation and where its weights are, whichever way training ended. This is also the number to note down for the run.
 
-> **Watch out.** If the session dies, save `OUTPUT_DIR` as a Kaggle Dataset, attach it to the next session, copy it back into `/kaggle/working/output`, and re-run — `resume_or_load(resume=True)` picks up where it stopped.
+> **Watch out.** If the session dies, save `OUTPUT_DIR` as a Kaggle Dataset, attach it to the next session, copy it back into `/kaggle/working/output`, and re-run — `resume_or_load(resume=True)` picks up the weights and `early_stop.json` picks up the patience count. Copy the **whole** directory: `last_checkpoint`, the `model_*.pth` files, `model_best.pth` and `early_stop.json` belong together.
 
 
 ## Cell 10 — Inference helpers
@@ -571,31 +674,38 @@ during training.
  7
  8  def load_trained_model(weights=None):
  9      cfg_i = build_cfg()
-10      cfg_i.MODEL.WEIGHTS = weights or os.path.join(cfg.OUTPUT_DIR, "model_final.pth")
-11      model = build_model(cfg_i)
-12      DetectionCheckpointer(model).load(cfg_i.MODEL.WEIGHTS)
-13      model.eval()
-14      return cfg_i, model
-15
-16
-17  def predict(model, cfg_i, dicts, top_k=10):
-18      """Run the model over a list of dataset dicts -> COCO results."""
-19      loader = build_detection_test_loader(
-20          dicts, mapper=DatasetMapper(cfg_i, is_train=False))
-21      results = []
-22      with torch.no_grad():
-23          for batch in loader:
-24              for inp, out in zip(batch, model(batch)):
-25                  inst = out["instances"].to("cpu")
-26                  order = inst.scores.argsort(descending=True)[:top_k]
-27                  for i in order.tolist():
-28                      results.append({
-29                          "image_id": int(inp["image_id"]),
-30                          "category_id": 1,
-31                          "segmentation": encode_binary_mask(inst.pred_masks[i].numpy()),
-32                          "score": float(inst.scores[i]),
-33                      })
-34      return results
+10      if weights is None:                        # best val checkpoint, else the last one
+11          best = os.path.join(cfg.OUTPUT_DIR, "model_best.pth")
+12          weights = best if os.path.exists(best) else os.path.join(cfg.OUTPUT_DIR, "model_final.pth")
+13      cfg_i.MODEL.WEIGHTS = weights
+14      print("weights:", weights)
+15      model = build_model(cfg_i)
+16      DetectionCheckpointer(model).load(cfg_i.MODEL.WEIGHTS)
+17      model.eval()
+18      return cfg_i, model
+19
+20
+21  def predict(model, cfg_i, dataset, top_k=10):
+22      """Run the model over a dataset name or a list of dicts -> COCO results."""
+23      loader = build_detection_test_loader(
+24          dataset if isinstance(dataset, list) else cfg_i,
+25          **({} if isinstance(dataset, list) else {"dataset_name": dataset}),
+26          mapper=DatasetMapper(cfg_i, is_train=False),
+27      )
+28      results = []
+29      with torch.no_grad():
+30          for batch in loader:
+31              for inp, out in zip(batch, model(batch)):
+32                  inst = out["instances"].to("cpu")
+33                  order = inst.scores.argsort(descending=True)[:top_k]
+34                  for i in order.tolist():
+35                      results.append({
+36                          "image_id": int(inp["image_id"]),
+37                          "category_id": 1,
+38                          "segmentation": encode_binary_mask(inst.pred_masks[i].numpy()),
+39                          "score": float(inst.scores[i]),
+40                      })
+41      return results
 ```
 
 **Line by line**
@@ -607,97 +717,189 @@ during training.
 - **L5** — Return the RLE dict.
 - **L6–8** — Blank lines, then the model loader.
 - **L9** — Rebuild the config from scratch rather than mutating the training one, so inference cannot be affected by leftover state.
-- **L10** — Use an explicit checkpoint if given, otherwise the final weights from training.
-- **L11** — `build_model` constructs the architecture from the config, with random weights.
-- **L12** — `DetectionCheckpointer(...).load(...)` fills in the trained weights.
-- **L13** — **Eval mode.** In eval mode the model returns predictions; in train mode it would return a loss dict. Forgetting this produces a confusing `KeyError` on `instances` later.
-- **L14** — Return both, since prediction needs the config too.
-- **L15–17** — Blank lines, then the prediction driver.
-- **L18** — Its docstring. It takes a plain list of dataset dicts, which is what both callers have: `DatasetCatalog.get` returns one for the validation fold, and the unregistered test set is built as one in cell 12.
-- **L19–20** — Build a test loader straight from that list — `build_detection_test_loader` accepts a list as its dataset, so no registration is needed. The mapper is the built-in one in eval mode: the **same** preprocessing as training, which is the whole reason for not using `DefaultPredictor` here.
-- **L21** — Accumulator for the COCO-format results.
-- **L22** — No gradients during inference.
-- **L23** — Iterate batches.
-- **L24** — Zip inputs with outputs so each prediction keeps the `image_id` of the image it came from.
-- **L25** — Move the `Instances` to CPU once, rather than per-field.
-- **L26** — Sort detections by score, highest first, and keep only the top `top_k`. The official metric uses `maxDets=10`, so anything past the tenth cannot help.
-- **L27** — Loop over the surviving indices.
-- **L28** — Open the prediction dict.
-- **L29** — The image id, taken from the input record so it can never drift out of step with the image.
-- **L30** — **Always `1`.** The model predicts contiguous class `0`; the submission format requires the original category id `1`. This is the mapping's other half, and getting it wrong yields a structurally valid file that scores zero.
-- **L31** — `pred_masks[i]` is a bool tensor already rescaled to the chip's original size — detectron2 uses the `height`/`width` in the input record to do that. Encode it to RLE.
-- **L32** — The confidence, cast to a plain float so it is JSON-serialisable.
-- **L33** — Close the dict and append.
-- **L34** — Return all predictions.
+- **L10–12** — With no explicit checkpoint, prefer `model_best.pth` — the early-stopping pick — and fall back to `model_final.pth` for a run trained before early stopping existed. After an early stop there *is* no `model_final.pth`, so the old default would have failed.
+- **L13–14** — Set the weights, and print which file was chosen so the output records what was scored.
+- **L15** — `build_model` constructs the architecture from the config, with random weights.
+- **L16** — `DetectionCheckpointer(...).load(...)` fills in the trained weights. It reads the `{"model": state_dict}` layout that both detectron2's checkpoints and `model_best.pth` use.
+- **L17** — **Eval mode.** In eval mode the model returns predictions; in train mode it would return a loss dict. Forgetting this produces a confusing `KeyError` on `instances` later.
+- **L18** — Return both, since prediction needs the config too.
+- **L19–21** — Blank lines, then the prediction driver.
+- **L22** — Its docstring. It accepts either a registered dataset name (the val fold) or a plain list of dicts (the unregistered test set built in cell 12).
+- **L23–27** — Build a test loader for either case: a list is passed as the dataset directly, while a name goes through the config-based form with `dataset_name`. The mapper is the built-in one in eval mode: the **same** preprocessing as training, which is the whole reason for not using `DefaultPredictor` here.
+- **L28** — Accumulator for the COCO-format results.
+- **L29** — No gradients during inference.
+- **L30** — Iterate batches.
+- **L31** — Zip inputs with outputs so each prediction keeps the `image_id` of the image it came from.
+- **L32** — Move the `Instances` to CPU once, rather than per-field.
+- **L33** — Sort detections by score, highest first, and keep only the top `top_k`. The official metric uses `maxDets=10`, so anything past the tenth cannot help.
+- **L34** — Loop over the surviving indices.
+- **L35** — Open the prediction dict.
+- **L36** — The image id, taken from the input record so it can never drift out of step with the image.
+- **L37** — **Always `1`.** The model predicts contiguous class `0`; the submission format requires the original category id `1`. This is the mapping's other half, and getting it wrong yields a structurally valid file that scores zero.
+- **L38** — `pred_masks[i]` is a bool tensor already rescaled to the chip's original size — detectron2 uses the `height`/`width` in the input record to do that. Encode it to RLE.
+- **L39** — The confidence, cast to a plain float so it is JSON-serialisable.
+- **L40** — Close the dict and append.
+- **L41** — Return all predictions.
 
 > **Watch out.** `DefaultPredictor` would read the image from disk with its own preprocessing, bypassing this config. Any divergence between training and inference preprocessing costs accuracy silently, which is why inference reuses the same mapper.
 
 
-## Cell 11 — Scoring against the official metric
+## Cell 11 — Scoring: official AP breakdown and mask IoU
 
-`COCOEvaluator` reports stock COCO numbers, whose area bins and `maxDets` differ from this
-challenge's. This cell reproduces the official settings exactly, so the number you compare
-across experiments is the one the leaderboard will report.
+`COCOEvaluator`'s area bins differ from this challenge's. This cell reproduces the official
+scorer's settings exactly — its six AP numbers were checked to match
+`competition_release/tools/evaluate_coco.py` to three decimals — and adds two mask-IoU numbers
+that AP does not show directly.
 
 ```python
- 1  OFFICIAL_MAXDETS = [1, 5, 10]
- 2  OFFICIAL_AREA_RNG = [[0, 1e10], [0, 300], [300, 2000], [2000, 1e10]]
- 3  OFFICIAL_AREA_LBL = ["all", "small", "medium", "large"]
- 4
- 5
- 6  def score_official(gt_json_path, predictions):
- 7      """COCO segm AP using the challenge's maxDets and area ranges."""
- 8      if not predictions:
- 9          print("no predictions - nothing to score")
-10          return None
-11      coco_gt = COCO(str(gt_json_path))
-12      coco_dt = coco_gt.loadRes(list(predictions))
-13      ev = COCOeval(coco_gt, coco_dt, "segm")
-14      ev.params.maxDets = OFFICIAL_MAXDETS
-15      ev.params.areaRng = OFFICIAL_AREA_RNG
-16      ev.params.areaRngLbl = OFFICIAL_AREA_LBL
-17      ev.evaluate()
-18      ev.accumulate()
-19
-20      area_i = ev.params.areaRngLbl.index("all")
-21      det_i = ev.params.maxDets.index(10)
-22      prec = ev.eval["precision"][:, :, :, area_i, det_i]
-23      primary = float(np.mean(prec[prec > -1])) if (prec > -1).any() else -1.0
-24      print(f"AP @[IoU=0.50:0.95 | area=all | maxDets=10] = {primary:.4f}   <- ranking metric")
-25      return primary
-26
-27
-28  if RUN_INFER:
-29      cfg_i, model = load_trained_model()
-30      val_preds = predict(model, cfg_i, val_dicts, top_k=10)
-31      print(f"{len(val_preds)} predictions over {len(val_dicts)} validation images")
-32      score_official(DATA / "annotations" / "instances_val_fold.json", val_preds)
+  1  OFFICIAL_MAXDETS = [1, 5, 10]
+  2  OFFICIAL_AREA_RNG = [[0, 1e10], [0, 300], [300, 2000], [2000, 1e10]]
+  3  OFFICIAL_AREA_LBL = ["all", "small", "medium", "large"]
+  4
+  5
+  6  def _ap(ev, area="all", iou_thr=None, max_det=10):
+  7      """Mean precision for one row of the challenge's summary table."""
+  8      prec = ev.eval["precision"]
+  9      if iou_thr is not None:
+ 10          prec = prec[np.isclose(ev.params.iouThrs, iou_thr)]
+ 11      prec = prec[:, :, :, ev.params.areaRngLbl.index(area), ev.params.maxDets.index(max_det)]
+ 12      valid = prec[prec > -1]
+ 13      return float(valid.mean()) if valid.size else -1.0
+ 14
+ 15
+ 16  def iou_metrics(coco_gt, predictions, max_det=10, match_thr=0.5, fg_score=0.5):
+ 17      """Two mask-IoU numbers that AP does not show directly.
+ 18
+ 19      matched_iou    - mean IoU of prediction/GT pairs, greedily matched by score
+ 20                       (top `max_det` per image, IoU >= `match_thr`), as COCOeval does.
+ 21      foreground_iou - pixel IoU of the union of predictions scoring >= `fg_score`
+ 22                       against the union of GT masks, summed over all images.
+ 23      """
+ 24      by_img = {}
+ 25      for p in predictions:
+ 26          by_img.setdefault(p["image_id"], []).append(p)
+ 27
+ 28      matched, inter, union = [], 0, 0
+ 29      for img_id in coco_gt.getImgIds():
+ 30          info = coco_gt.imgs[img_id]
+ 31          h, w = info["height"], info["width"]
+ 32          gts = [coco_gt.annToRLE(a) for a in coco_gt.loadAnns(coco_gt.getAnnIds(imgIds=img_id))]
+ 33          dts = sorted(by_img.get(img_id, []), key=lambda p: -p["score"])[:max_det]
+ 34
+ 35          if gts and dts:
+ 36              ious = mask_utils.iou([d["segmentation"] for d in dts], gts, [0] * len(gts))
+ 37              taken = set()
+ 38              for row in np.atleast_2d(ious):
+ 39                  best, best_j = match_thr, -1
+ 40                  for j, v in enumerate(row):
+ 41                      if j not in taken and v >= best:
+ 42                          best, best_j = v, j
+ 43                  if best_j >= 0:
+ 44                      taken.add(best_j)
+ 45                      matched.append(best)
+ 46
+ 47          gt_fg = np.zeros((h, w), bool)
+ 48          for r in gts:
+ 49              gt_fg |= mask_utils.decode(r).astype(bool)
+ 50          dt_fg = np.zeros((h, w), bool)
+ 51          for d in dts:
+ 52              if d["score"] >= fg_score:
+ 53                  dt_fg |= mask_utils.decode(d["segmentation"]).astype(bool)
+ 54          inter += int((gt_fg & dt_fg).sum())
+ 55          union += int((gt_fg | dt_fg).sum())
+ 56
+ 57      return {
+ 58          "matched_iou": float(np.mean(matched)) if matched else 0.0,
+ 59          "n_matched": len(matched),
+ 60          "foreground_iou": inter / union if union else 0.0,
+ 61      }
+ 62
+ 63
+ 64  def score_official(gt_json_path, predictions):
+ 65      """COCO segm AP using the challenge's maxDets and area ranges, plus mask IoU."""
+ 66      if not predictions:
+ 67          print("no predictions - nothing to score")
+ 68          return None
+ 69      coco_gt = COCO(str(gt_json_path))
+ 70      # copies: loadRes writes bbox/area into each dict, which corrupts a second scoring
+ 71      coco_dt = coco_gt.loadRes([dict(p) for p in predictions])
+ 72      ev = COCOeval(coco_gt, coco_dt, "segm")
+ 73      ev.params.maxDets = OFFICIAL_MAXDETS
+ 74      ev.params.areaRng = OFFICIAL_AREA_RNG
+ 75      ev.params.areaRngLbl = OFFICIAL_AREA_LBL
+ 76      ev.evaluate()
+ 77      ev.accumulate()
+ 78
+ 79      metrics = {
+ 80          "AP":        _ap(ev),
+ 81          "AP50":      _ap(ev, iou_thr=0.50),
+ 82          "AP75":      _ap(ev, iou_thr=0.75),
+ 83          "AP_small":  _ap(ev, area="small"),
+ 84          "AP_medium": _ap(ev, area="medium"),
+ 85          "AP_large":  _ap(ev, area="large"),
+ 86      }
+ 87      n_gt = len(coco_gt.getAnnIds())
+ 88      metrics.update(iou_metrics(coco_gt, predictions))
+ 89
+ 90      print(f"AP        @[IoU=0.50:0.95 | area=all    | maxDets=10] = {metrics['AP']:.4f}   <- ranking metric")
+ 91      print(f"AP50      @[IoU=0.50      | area=all    | maxDets=10] = {metrics['AP50']:.4f}")
+ 92      print(f"AP75      @[IoU=0.75      | area=all    | maxDets=10] = {metrics['AP75']:.4f}")
+ 93      print(f"AP_small  @[IoU=0.50:0.95 | area=small  | maxDets=10] = {metrics['AP_small']:.4f}")
+ 94      print(f"AP_medium @[IoU=0.50:0.95 | area=medium | maxDets=10] = {metrics['AP_medium']:.4f}")
+ 95      print(f"AP_large  @[IoU=0.50:0.95 | area=large  | maxDets=10] = {metrics['AP_large']:.4f}")
+ 96      print(f"matched mask IoU (IoU>=0.5)                        = {metrics['matched_iou']:.4f}"
+ 97            f"   ({metrics['n_matched']}/{n_gt} GT instances matched)")
+ 98      print(f"foreground IoU   (score>=0.5, all images)          = {metrics['foreground_iou']:.4f}")
+ 99      return metrics
+100
+101
+102  if RUN_INFER:
+103      cfg_i, model = load_trained_model()
+104      val_preds = predict(model, cfg_i, "rts_val", top_k=10)
+105      print(f"{len(val_preds)} predictions over {len(val_dicts)} validation images")
+106      val_metrics = score_official(DATA / "annotations" / "instances_val_fold.json", val_preds)
 ```
 
 **Line by line**
 
-- **L1** — `maxDets` from the official scorer: `[1, 5, 10]`. COCO's default is `[1, 10, 100]`, so this alone changes the headline number.
+- **L1** — `maxDets` from the official scorer: `[1, 5, 10]`. COCO's default is `[1, 10, 100]`.
 - **L2** — The official area ranges. COCO's defaults are 32² = 1024 and 96² = 9216; this challenge uses **300** and **2000**, which reclassifies most of this dataset. Under the official bins the split is 25% small / 51% medium / 24% large.
 - **L3** — The labels, in the same order as the ranges — `COCOeval` pairs them positionally.
-- **L4–7** — Blank lines, then the scoring function and its docstring. It takes a ground-truth JSON path and an in-memory prediction list.
-- **L8–10** — An empty prediction list is legal but `loadRes` chokes on it, so return early with a clear message instead of an opaque pycocotools error.
-- **L11** — Load the ground truth for this fold. Its `category_id` values are the original `1`, matching what `predict` emits.
-- **L12** — `loadRes` accepts a list of prediction dicts directly, so nothing needs writing to disk first.
-- **L13** — Build the evaluator in **`segm`** mode — this challenge scores masks, not boxes.
-- **L14–16** — Override the three parameters that differ from COCO's defaults. Setting these *after* construction is required, since `COCOeval` fills in defaults during `__init__`.
-- **L17** — Per-image, per-category matching of predictions to ground truth.
-- **L18** — Aggregate those matches into the precision/recall arrays.
-- **L19–20** — Blank line, then locate the `all` area bin by label rather than by a hardcoded index, so it stays correct if the ordering ever changes.
-- **L21** — Locate `maxDets=10` the same way.
-- **L22** — Slice the precision array, which is indexed `[IoU, recall, category, area, maxDets]`. Keeping the first three axes averages over all ten IoU thresholds — that is what the `0.50:0.95` in the metric name means.
-- **L23** — Average the valid entries. `COCOeval` writes `-1` where a cell has no data, so those must be filtered out or they drag the mean down.
-- **L24** — Print the single number that decides the ranking.
-- **L25** — Return it for programmatic comparison across runs.
-- **L26–28** — Blank lines, then the inference block, guarded by its stage switch.
-- **L29** — Load the trained weights.
-- **L30** — Predict over the validation fold, capped at 10 detections per image to match the metric.
-- **L31** — Report the prediction count — roughly 10× the image count, since the low score threshold lets most slots fill.
-- **L32** — Score against the validation fold's ground truth. **This is the number to compare between experiments**, not the `COCOEvaluator` output printed during training.
+- **L4–6** — Blank lines, then `_ap`: one row of the official summary table, mirroring `summarize_metric` in `evaluate_coco.py`.
+- **L7** — Its docstring.
+- **L8** — `eval["precision"]` is indexed `[IoU threshold, recall point, category, area range, maxDets]`.
+- **L9–10** — For AP50 or AP75, keep only that IoU threshold. `np.isclose` rather than `==`, because the thresholds come from `np.linspace` and `0.75` is not exactly representable. With no threshold, all ten (0.50:0.05:0.95) stay — which is what `AP@[.50:.95]` means.
+- **L11** — Select the area range and `maxDets` **by label and value** rather than by hardcoded index, so this cannot silently read the wrong column if either list changes.
+- **L12–13** — Average the valid cells. `COCOeval` writes `-1` where a cell has no data — for example an area bin with no ground truth — and those must be excluded or they drag the mean down. `-1` is returned if nothing is valid, as the official scorer does.
+- **L14–16** — Blank lines, then the IoU function. Its two outputs answer different questions from AP.
+- **L17–23** — The docstring defines both. **Matched IoU** asks *how good are the masks the model got right* — AP75 versus AP50 hints at this, but this reports it directly. **Foreground IoU** ignores instances altogether and asks *how much of the thaw-slump area does the model cover* — the number to quote if the downstream use is mapping disturbed ground rather than counting slumps.
+- **L24–26** — Group predictions by image.
+- **L27–29** — Blank line, then accumulators: the IoU of every matched pair, and pooled pixel intersection and union, then a loop over every **ground-truth** image — so an image the model predicted nothing on still contributes its full ground-truth area to the union.
+- **L30–31** — The image size, needed to build empty masks.
+- **L32** — The image's ground-truth masks as RLE. `annToRLE` normalises polygons or uncompressed RLE, though this dataset only has compressed RLE.
+- **L33** — The top `max_det` predictions by score — the same cut the official metric applies.
+- **L34–36** — Blank line, then the pairwise mask-IoU matrix, predictions × ground truth, computed directly on RLE. The `iscrowd` flags are all `0`: this data has no crowd annotations, and a `1` would switch pycocotools to intersection-over-prediction-area.
+- **L37–45** — **Greedy matching, in score order**, which is how `COCOeval` matches too: each prediction, highest score first, claims the unclaimed ground-truth instance it overlaps most, provided that overlap is at least `match_thr`. `atleast_2d` guards the single-prediction case. Each ground-truth instance is matched at most once, so duplicate detections of one slump do not inflate the average.
+- **L46–53** — Blank line, then foreground IoU. Merge the image's ground-truth masks into one boolean map and the predictions scoring at least `fg_score` into another. The 0.5 threshold matters here in a way it does not for AP: AP ranks by score, whereas this is a hard yes/no per pixel, so the low-confidence tail kept for AP would otherwise paint large false-positive areas.
+- **L54–55** — Accumulate intersection and union **as pixel counts across all images**, not as a mean of per-image IoUs. A per-image mean would let a 150-pixel chip weigh as much as a 290×290 one, and an image with no prediction and a tiny slump would pull it down as hard as a large miss.
+- **L56–61** — Blank line, then return the mean matched IoU, the number of matches (a high IoU over few matches is not a good model), and the pooled foreground IoU. Each guards its empty case.
+- **L62–64** — Blank lines, then the scoring function.
+- **L65** — Its docstring.
+- **L66–68** — An empty prediction list is legal but `loadRes` chokes on it, so return early with a clear message instead of an opaque pycocotools error.
+- **L69** — Load the ground truth for this fold. Its `category_id` values are the original `1`, matching what `predict` emits.
+- **L70–71** — **Score copies of the predictions.** `loadRes` writes `bbox`, `area`, `id` and `iscrowd` *into each dict it is given*. Scoring the same list a second time — re-running the cell, or saving it and running `evaluate_coco.py` on it — would then hit pycocotools' `bbox` branch, which recomputes each area from the *box* instead of the mask, and every small/medium/large number shifts (AP_medium moved from 0.572 to 0.543 in testing). `dict(p)` is a shallow copy, which is enough: `loadRes` only adds top-level keys.
+- **L72** — Build the evaluator in **`segm`** mode — this challenge scores masks, not boxes.
+- **L73–75** — Override the three parameters that differ from COCO's defaults. Setting these *after* construction is required, since `COCOeval` fills in defaults during `__init__`.
+- **L76–77** — Match predictions to ground truth, then aggregate into the precision/recall arrays.
+- **L78–86** — Blank line, then the six AP numbers the leaderboard displays, each one `_ap` call. `AP` — IoU 0.50:0.95, all areas, top 10 — is the **ranking metric**; the other five explain it. From the baseline, AP50 flat while AP75 climbs means the model already *finds* slumps and is gaining on mask boundaries, and a low AP_small next to a high AP_large points at resolution and anchors.
+- **L87–88** — Count ground-truth instances for the match ratio, and add the IoU numbers to the same dict.
+- **L89–98** — Blank line, then print everything in one aligned table.
+- **L99** — Return the dict, so runs can be compared programmatically.
+- **L100–102** — Blank lines, then the inference block, guarded by its stage switch.
+- **L103** — Load the trained weights — `model_best.pth` by default, per cell 10.
+- **L104** — Predict over the validation fold, capped at 10 detections per image to match the metric.
+- **L105** — Report the prediction count — roughly 10× the image count, since the low score threshold lets most slots fill.
+- **L106** — Score against the validation fold's ground truth and keep the result as `val_metrics`. **These are the numbers to compare between experiments.**
 
 
 ## Cell 12 — Test inference and the submission file
@@ -783,12 +985,15 @@ This cell is prose, not code. It reads:
 >    they are one coupled decision.
 > 2. **Learning rate and schedule.** `0.0025` is the linear-scaling upper bound; fine-tuning
 >    642 images often prefers less.
-> 3. **Augmentation.** Rotations are as defensible as the flips already here, for the same
->    reason — nadir imagery has no canonical orientation.
+> 3. **Augmentation.** This run is vanilla: detectron2's default resize + horizontal flip.
+>    Vertical flips and 90° rotations are the first additions to try — nadir imagery has
+>    no canonical orientation.
 > 4. **`MODEL.BACKBONE.FREEZE_AT`.** Default `2`. On 642 images, freezing early layers is a
 >    reasonable regulariser; worth an ablation against `0`.
 > 5. **More channels.** Only once the RGB pipeline is solid. That means leaving the PNG path
 >    and reinstating a custom mapper — see the appendix of `detectron2_training_guide.md`.
 >
-> Compare runs on the number from cell 11, not on the `COCOEvaluator` output printed during
-> training: those use COCO's area bins and `maxDets`, not this challenge's.
+> Compare runs on the numbers from cell 11. During training, `segm/AP`, `AP50` and `AP75` already
+> match the official scorer (the evaluator uses `maxDets=10`), but `APs/APm/APl` there still use
+> COCO's area bins. Early stopping picks `model_best.pth` *on val*, so its val AP is slightly
+> optimistic — the test leaderboard is the unbiased check.
