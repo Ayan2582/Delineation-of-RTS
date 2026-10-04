@@ -1,2 +1,4 @@
 /competition_release
 /data_png
+*.jpg
+*.parquet
