@@ -4,3 +4,5 @@
 *.parquet
 *.html
 *.json
+/results
+/data_split*

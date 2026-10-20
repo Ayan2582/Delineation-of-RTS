@@ -1,0 +1,9 @@
+# E4: late fusion at every level C2-C5, then FPN. Same streams as E3.
+_base_: base.yaml
+name: e4
+experiment: late_fpn
+streams:
+  swin: [red, green, blue, nir]
+  terrain: [relative_elevation, shaded_relief, ndvi]
+flags:
+  ndwi_to_terrain: false            # ablation: terrain gets NDWI as a 4th channel

@@ -1,0 +1,9 @@
+# E3: late fusion at C5 only, no FPN. Optical -> Swin (stem 3 -> 4), terrain -> ResNet18.
+_base_: base.yaml
+name: e3
+experiment: late_c5
+streams:
+  swin: [red, green, blue, nir]
+  terrain: [relative_elevation, shaded_relief, ndvi]
+flags:
+  ndwi_to_terrain: false            # ablation: terrain gets NDWI as a 4th channel

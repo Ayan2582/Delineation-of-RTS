@@ -1,0 +1,53 @@
+# Shared by E1-E4. Anything an experiment may change lives in e*.yaml; everything here is
+# identical across experiments so the comparison is fair.
+data:
+  root: ../competition_release        # release folder (train/, metadata/, tools/)
+  cache_dir: cache                    # NaN-filled tiles + per-fold stats
+  folds_file: splits/grouped_folds.json  # leak-free: overlapping chips grouped + held-out test_ids
+                                         # (make_grouped_split.py); splits/folds.json = old random folds
+  n_folds: 5
+  fold_seed: 0
+  num_workers: 2
+  limit: null                         # debug: use only the first N images
+
+aug:
+  hflip: 0.5
+  vflip: 0.5
+  rot90: true                         # k ~ U{0,1,2,3}
+  crop: 512                           # random crop only when a tile is larger
+  jitter_p: 0.8
+  brightness: 0.2                     # additive shift, in std units (inputs are z-scored)
+  contrast: 0.2                       # scale ~ U[1-c, 1+c] about the mean (0)
+  jitter_bands: [red, green, blue, nir]   # optical only; never NDVI/NDWI/DEM
+
+model:
+  pretrained: true                    # Swin_V2_B_Weights.NAIP_RGB_SI_SATLAS
+  fpn_channels: 256
+  anchor_sizes: [32, 64, 128, 256, 512]
+  aspect_ratios: [0.5, 1.0, 2.0]
+  box_roi: 7
+  mask_roi: 14
+  box_fc: 1024
+  mask_convs: 4
+  num_classes: 2                      # RTS + background
+  fuse_gn_groups: 32
+  terrain_gn_groups: 16
+  mask_logits_init_std: null          # null = torchvision default init; 0.001 = detectron2-style
+
+train:
+  epochs: 50
+  batch_size: 8
+  weight_decay: 0.05
+  warmup_epochs: 1
+  lr:
+    swin: 1.0e-4
+    terrain: 1.0e-3
+    other: 1.0e-3                     # fusion, FPN, RPN, heads
+  clip_grad: 1.0
+  amp: true
+
+eval:
+  score_thresh: 0.5                   # mean-IoU only; COCO AP uses all detections
+  mask_thresh: 0.5
+
+out_dir: outputs

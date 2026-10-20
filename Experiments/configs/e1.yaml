@@ -1,0 +1,7 @@
+# E1: single stream with FPN. Swin stem unchanged (3 channels).
+_base_: base.yaml
+name: e1
+experiment: single_fpn
+streams:
+  swin: [green, nir, relative_elevation]
+flags: {}

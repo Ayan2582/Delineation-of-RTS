@@ -1,0 +1,8 @@
+# E2: early fusion with FPN. All 8 bands into Swin, stem expanded 3 -> 8 (7 with drop_ndwi).
+_base_: base.yaml
+name: e2
+experiment: early_fpn
+streams:
+  swin: [red, green, blue, ndvi, relative_elevation, shaded_relief, nir, ndwi]
+flags:
+  drop_ndwi: false
