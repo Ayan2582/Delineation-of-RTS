@@ -25,7 +25,7 @@ _KERNEL = np.array([[1, 1, 1],
 
 def fill_nan_neighbor_mean(img: np.ndarray,
                            max_iter: int = 200,
-                           fallback: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+                           fallback: np.ndarray | None = None) -> np.ndarray:
     """Replace NaNs with the mean of their valid 8-neighbours.
 
     One pass only fills NaNs that touch a valid pixel, so it repeats, filling
@@ -39,11 +39,9 @@ def fill_nan_neighbor_mean(img: np.ndarray,
                   you pass in; if None, the tile's own channel mean, else 0.
 
     Returns:
-        filled: (C, H, W) float32, no NaNs.
-        valid:  (C, H, W) bool, True where the ORIGINAL value was real.
+        (C, H, W) float32. NaN-free unless `fallback` itself holds NaNs.
     """
     img = img.astype(np.float64, copy=True)
-    valid = ~np.isnan(img)
 
     for c in range(img.shape[0]):
         band = img[c]
@@ -72,7 +70,7 @@ def fill_nan_neighbor_mean(img: np.ndarray,
             band[nan] = fv
         img[c] = band
 
-    return img.astype(np.float32), valid
+    return img.astype(np.float32)
 
 
 # ----------------------------------------------------------------------------- 2. stats + normalise
@@ -126,58 +124,33 @@ def pad_collate(batch, size_divisible: int = 32):
     return torch.stack(images), targets
 
 
-# ----------------------------------------------------------------------------- torchvision Mask R-CNN gotcha
-
-def disable_internal_resize(model, size_divisible: int = 32):
-    """torchvision's Mask R-CNN resizes every image to min_size=800 and applies
-    ImageNet mean/std by default. That would (a) rescale your 4 m pixels and
-    (b) re-normalise already-normalised terrain bands. Turn both off; the
-    model's own padding (zeros) is still mean padding because inputs are normalised.
-    """
-    from torchvision.models.detection.transform import GeneralizedRCNNTransform
-
-    class NoResize(GeneralizedRCNNTransform):
-        def resize(self, image, target=None):
-            return image, target
-
-    C = 3  # only used to build placeholder mean/std; overridden below
-    t = NoResize(min_size=1, max_size=10_000,
-                 image_mean=[0.0] * C, image_std=[1.0] * C,
-                 size_divisible=size_divisible)
-    t.normalize = lambda image: image        # inputs already standardised
-    model.transform = t
-    return model
-
-
 # ----------------------------------------------------------------------------- dataset
 
 class RTSDataset(torch.utils.data.Dataset):
-    """Expects items as (raw_image (C,H,W) with NaNs, masks (N,H,W), labels (N,)).
+    """Expects items as (raw_image (C,H,W) with NaNs, masks (N,H,W)).
 
     NaN filling is deterministic, so do it ONCE and cache (here: at init).
-    Augmentations go in `transform`, applied after fill + normalise.
+    Augmentations go in `transform`, applied after fill + normalise. The task has one class, so
+    labels follow the masks: augmentation may add instances (copy-paste) or crop them away.
     """
 
     def __init__(self, items, mean, std, transform=None):
         self.mean, self.std, self.transform = mean, std, transform
-        self.cache = []
-        for img, masks, labels in items:
-            filled, _ = fill_nan_neighbor_mean(img, fallback=mean)
-            self.cache.append((normalize(filled, mean, std), masks, labels))
+        self.cache = [(normalize(fill_nan_neighbor_mean(img, fallback=mean), mean, std), masks)
+                      for img, masks in items]
 
     def __len__(self):
         return len(self.cache)
 
     def __getitem__(self, i):
-        img, masks, labels = self.cache[i]
+        img, masks = self.cache[i]
         img = torch.from_numpy(img)
         masks = torch.as_tensor(masks, dtype=torch.uint8)
         if self.transform:
             img, masks = self.transform(img, masks)
-        keep = masks.flatten(1).bool().any(1)                     # drop instances cropped away
-        masks, labels = masks[keep], torch.as_tensor(labels)[keep]
-        boxes = _masks_to_boxes(masks)
-        return img, {"boxes": boxes, "labels": labels.long(), "masks": masks}
+        masks = masks[masks.flatten(1).bool().any(1)]                # drop instances cropped away
+        return img, {"boxes": _masks_to_boxes(masks), "labels": torch.ones(len(masks), dtype=torch.int64),
+                     "masks": masks}
 
 
 def _masks_to_boxes(masks: torch.Tensor) -> torch.Tensor:

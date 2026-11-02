@@ -1,0 +1,6 @@
+# E2 + boundary head: E2 with a boundary branch fused into the mask predictor and a boundary
+# loss on the RoI outline (models/boundary.py). Targets AP75 (outline precision).
+_base_: e2.yaml
+name: e2_boundary
+model:
+  boundary_head: true

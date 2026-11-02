@@ -1,8 +1,40 @@
-/competition_release
-/data_png
-*.jpg
+# Pushed: code, configs, splits (Experiments/splits/*.json), docs, EDA figures.
+# Everything below is data, model output or local-only.
+
+# ---- data (download separately; see README) ----
+/competition_release/
+/data_png/
+/data_split*/
+*.npz
 *.parquet
+*.zip
+
+# ---- training outputs, checkpoints, logs ----
+/results/
+/submissions/
+**/outputs/
+**/cache/
+*.pth
+*.pt
+*.ckpt
+events.out.tfevents.*
+
+# ---- DARTS dataset build artefacts ----
+DARTS_EDA/chips/
+DARTS_EDA/dataset/
+DARTS_EDA/kaggle_darts/
+DARTS_EDA/*_log.txt
+DARTS_EDA/.venv/
+
+# ---- private notes, analysis dumps, leftovers ----
+/learning_docs/
+/test_analysis/
+/mmlab/
+*.jpg
 *.html
-*.json
-/results
-/data_split*
+
+# ---- python / editors ----
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/

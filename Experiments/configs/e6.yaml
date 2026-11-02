@@ -1,0 +1,8 @@
+# E6: E2 + band gate + boundary head. Early-fusion Swin-V2-B Mask R-CNN whose input bands are
+# re-weighted per image (robust to the NIR/DEM shift of unseen sites) and whose masks are refined by
+# an explicit boundary branch (outline precision, AP75). Ablations: e2, e2_gate, e2_boundary.
+_base_: e2.yaml
+name: e6
+model:
+  band_gate: true
+  boundary_head: true

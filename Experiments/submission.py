@@ -4,6 +4,7 @@ Edit the constants below, then:
     python submission.py
 or override any of them from the command line:
     python submission.py --model ../results/e3_e4_result/outputs/runs/e4/fold2_seed0/best.pth --max_dets 5
+    add --check_val to first re-score the run's val fold (should reproduce its results.csv AP)
 
 The checkpoint's folder must also hold the run's config_resolved.yaml (train.py writes both).
 Preprocessing matches training: neighbour-mean NaN fill, the fold's train mean/std, the run's
@@ -29,23 +30,22 @@ import yaml
 from pycocotools import mask as mask_utils
 
 # ============================== constants: edit these ==============================
-MODEL      = "../results/e3_e4_result/outputs/runs/e4/fold2_seed0/best.pth"   # checkpoint to use
-MAX_DETS   = 10       # predictions kept per image (the scorer uses at most 10)
+MODEL      = "../results/e6_pretrained/outputs/runs/e6_darts_darts_ft/fold1_seed0/best.pth"   # checkpoint to use
+MAX_DETS   = 10   # predictions kept per image (the scorer uses at most 10)
 NO_OVERLAP = True     # later masks may not reuse pixels of higher-scoring masks
-MIN_KEEP   = 0.5      # with NO_OVERLAP: drop a mask left with less than this share of its pixels
-MIN_SCORE  = 0.0      # drop predictions below this score (the model already drops < 0.05)
+MIN_KEEP   = 1      # with NO_OVERLAP: drop a mask left with less than this share of its pixels
+MIN_SCORE  = 0.1  # drop predictions below this score (the model already drops < 0.05)
 DATA_ROOT  = "../competition_release"                                       # release folder
-STATS      = None     # fold's stats_*.json; None = recompute from that fold's train chips
-OUT        = "../submissions/submission.json"
+STATS      = None     # fold's stats_*.json; None = the run's stats.json next to best.pth, else recomputed
+OUT        = "../submissions/e6_pretrained_best_1/submission.json"
 BATCH_SIZE = 4
 # ===================================================================================
 
 CODE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(CODE_DIR))
 
-from data import load_raw, split_records, stream_indices                    # noqa: E402
-from models.build import build_model                                        # noqa: E402
-from predict import test_records                                            # noqa: E402
+from data import input_norm, load_raw, split_records, stream_indices, test_records   # noqa: E402
+from models.build import build_model                                                 # noqa: E402
 from rts_preprocess import compute_channel_stats, fill_nan_neighbor_mean, normalize, pad_collate  # noqa: E402
 
 MIN_PIXELS = 10       # the labels drop components smaller than this, so predictions do too
@@ -71,7 +71,7 @@ def load_model(model_path: Path, root: Path):
     return cfg, model.eval(), ckpt
 
 
-def fold_stats(cfg: dict, fold: int, stats_path: Path | None):
+def run_stats(cfg: dict, fold: int, stats_path: Path | None):
     """The normalisation the run was trained with: its stats file, or recomputed from the same chips."""
     if stats_path is not None:
         s = json.loads(stats_path.read_text())
@@ -106,16 +106,16 @@ def select(masks: np.ndarray, scores: np.ndarray, max_dets: int, no_overlap: boo
 
 
 @torch.no_grad()
-def predict(model, recs, mean, std, channels, mask_thresh, args, device) -> list[dict]:
+def predict(model, recs, mean, channels, mask_thresh, args, device, norm) -> list[dict]:
+    """`mean` is the raw train mean (NaN fallback); `norm` = input_norm(...) is what normalises."""
     results = []
     for i in range(0, len(recs), args.batch_size):
         chunk, batch = recs[i:i + args.batch_size], []
         for r in chunk:
-            with np.load(r["path"]) as z:
-                raw = np.ascontiguousarray(z["image"].transpose(2, 0, 1), dtype=np.float32)
+            raw = load_raw(r)
             assert raw.shape[1:] == (r["height"], r["width"]), f"size mismatch for {r['path']}"
-            filled, _ = fill_nan_neighbor_mean(raw, fallback=mean)
-            batch.append((torch.from_numpy(normalize(filled, mean, std))[channels], {}))
+            filled = fill_nan_neighbor_mean(raw, fallback=mean)
+            batch.append((torch.from_numpy(normalize(filled, *norm))[channels], {}))
         images, targets = pad_collate(batch)
         for r, out, t in zip(chunk, model(list(images.to(device))), targets):
             h, w = (int(v) for v in t["orig_size"])
@@ -141,6 +141,7 @@ def main():
     ap.add_argument("--stats", default=STATS, help="stats json of the run's fold (optional)")
     ap.add_argument("--out", default=OUT)
     ap.add_argument("--batch_size", type=int, default=BATCH_SIZE)
+    ap.add_argument("--check_val", action="store_true", help="re-score the run's val fold before predicting")
     args = ap.parse_args()
     if args.max_dets < 1:
         ap.error("--max_dets must be at least 1")
@@ -152,21 +153,36 @@ def main():
     cfg, model, ckpt = load_model(model_path, root)
     model.to(device)
     fold = ckpt["run"]["fold"]
-    mean, std, stats_src = fold_stats(cfg, fold, resolve(args.stats) if args.stats else None)
+    run_stats = model_path.parent / "stats.json"          # train.py copies the fold's stats here
+    stats = resolve(args.stats) if args.stats else (run_stats if run_stats.exists() else None)
+    mean, std, stats_src = run_stats(cfg, fold, stats)
 
     si = stream_indices(cfg)
     channels = si["swin"] + si["terrain"]
     trained = ckpt["run"]["channel_indices"]
     assert channels == trained["swin"] + trained["terrain"], "band order differs from the trained run"
 
-    print(f"model   {model_path}  ({ckpt['run']['experiment']}, fold {fold}, epoch {ckpt['epoch']}, "
-          f"val AP {ckpt['metrics']['AP']:.4f})")
+    val = f"val AP {ckpt['metrics']['AP']:.4f}" if ckpt.get("metrics") else "no val: fold 'all', last epoch"
+    print(f"model   {model_path}  ({ckpt['run']['experiment']}, fold {fold}, epoch {ckpt['epoch']}, {val})")
     print(f"stats   {stats_src}")
     print(f"device  {device} | max_dets {args.max_dets} | no_overlap {args.no_overlap} "
           f"(min_keep {args.min_keep}) | min_score {args.min_score}")
 
+    if args.check_val and not ckpt.get("metrics"):
+        print("--check_val skipped: this run (fold 'all') has no val split")
+    elif args.check_val:
+        from data import build_loaders
+        from eval import evaluate
+        vcfg = {**cfg, "data": {**cfg["data"], "folds_file": str(resolve(cfg["data"]["folds_file"])),
+                                "cache_dir": str(CODE_DIR / "cache"), "num_workers": 0}}
+        _, val_dl, val_recs = build_loaders(vcfg, fold, ckpt["run"]["seed"])
+        m = evaluate(model, val_dl, val_recs, vcfg, device, amp=False)
+        print(f"val     fold {fold}: AP {m['AP']:.4f} (recorded {ckpt['metrics']['AP']:.4f}), "
+              f"AP50 {m['AP50']:.4f}, mIoU {m['mIoU']:.4f}")
+
     recs = test_records(root)
-    results = predict(model, recs, mean, std, channels, cfg["eval"]["mask_thresh"], args, device)
+    results = predict(model, recs, mean, channels, cfg["eval"]["mask_thresh"], args, device,
+                      input_norm(cfg, mean, std))
 
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(results))

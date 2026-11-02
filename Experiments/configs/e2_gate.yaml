@@ -1,0 +1,6 @@
+# E2 + band gate: E2 (early fusion, all 8 bands into Swin) with a learned per-image band gate in
+# front of the backbone (models/gate.py). Pair with aug.band_drop_p > 0 (BAND_DROP_P in the notebook).
+_base_: e2.yaml
+name: e2_gate
+model:
+  band_gate: true

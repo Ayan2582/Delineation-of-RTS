@@ -7,6 +7,17 @@ from pathlib import Path
 import yaml
 
 CODE_DIR = Path(__file__).resolve().parent
+ALL_FOLD = "all"   # --fold all: train on every labelled chip (local test included), no val
+
+
+def parse_fold(s: str) -> int | str:
+    """--fold value: a grouped-CV fold index, or "all" for the final all-data model."""
+    if s == ALL_FOLD:
+        return ALL_FOLD
+    try:
+        return int(s)
+    except ValueError:
+        raise ValueError(f"--fold must be an integer or {ALL_FOLD!r}, got {s!r}") from None
 
 
 def _merge(base: dict, over: dict) -> dict:

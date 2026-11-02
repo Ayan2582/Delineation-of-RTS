@@ -2,7 +2,9 @@
 
     python eval.py --config configs/e4.yaml --fold 0 --seed 0   # score best.pth, append a CSV row
     python eval.py --config configs/e4.yaml --fold 0 --split test   # local held-out test -> results_test.csv
+    python eval.py --config configs/e4.yaml --fold 0 --split train  # fold's train chips, no augmentation
     python eval.py --summary [--split test]                     # mean ± std across folds
+Every per-run call also draws predictions on a few chips into results/figures/<run>/.
 """
 from __future__ import annotations
 
@@ -19,7 +21,7 @@ from pycocotools import mask as mask_utils
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
-from config import load_config, resolve_path, run_name
+from config import ALL_FOLD, load_config, parse_fold, resolve_path, run_name
 from data import build_loaders, build_test_loader, load_coco, release_root
 
 CSV_FIELDS = ["experiment", "fold", "seed", "best_epoch", "AP", "AP50", "AP75",
@@ -130,11 +132,13 @@ def mean_iou(gt: COCO, per_image: dict, score_thresh: float) -> float:
     return float(np.mean(ious)) if ious else 0.0
 
 
-def evaluate(model, loader, val_recs, cfg, device, amp: bool) -> dict:
+def evaluate(model, loader, val_recs, cfg, device, amp: bool, return_preds: bool = False):
+    """Metrics dict; with `return_preds`, (metrics, {image id: (masks, scores)})."""
     results, per_image = predict(model, loader, val_recs, device, amp, cfg["eval"]["mask_thresh"])
     gt = coco_gt(cfg, [r["id"] for r in val_recs])
-    return {**official_ap(gt, results, _scorer(cfg)), "AP_default": default_ap(gt, results),
-            "mIoU": mean_iou(gt, per_image, cfg["eval"]["score_thresh"])}
+    m = {**official_ap(gt, results, _scorer(cfg)), "AP_default": default_ap(gt, results),
+         "mIoU": mean_iou(gt, per_image, cfg["eval"]["score_thresh"])}
+    return (m, per_image) if return_preds else m
 
 
 def results_file(split: str) -> str:
@@ -172,11 +176,13 @@ def summarize(out_dir: str | Path, split: str = "val") -> "pd.DataFrame":
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config")
-    ap.add_argument("--fold", type=int)
+    ap.add_argument("--fold", type=parse_fold, help=f"grouped-CV fold index, or {ALL_FOLD!r} (train split only)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--override", nargs="*", default=[])
-    ap.add_argument("--split", choices=["val", "test"], default="val",
-                    help="test = the grouped split's held-out local test chips")
+    ap.add_argument("--split", choices=["train", "val", "test"], default="val",
+                    help="test = the grouped split's held-out local test chips; train = the fold's train chips")
+    ap.add_argument("--samples", type=int, default=8, help="chips drawn with GT and predictions; 0 = none")
+    ap.add_argument("--no_csv", action="store_true", help="score and draw only; do not append a CSV row")
     ap.add_argument("--summary", action="store_true")
     ap.add_argument("--out_dir", default=None, help="for --summary without --config")
     args = ap.parse_args()
@@ -189,21 +195,32 @@ def main():
     from models.build import build_model
 
     cfg = load_config(args.config, args.override)
+    if args.fold == ALL_FOLD:
+        if args.split != "train":
+            raise SystemExit(f"fold {ALL_FOLD!r} has no val, and it trained on the local test chips: use --split train")
+        args.no_csv = True        # results_*.csv hold cross-validation runs only
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt_path = resolve_path(cfg["out_dir"]) / "runs" / run_name(cfg) / f"fold{args.fold}_seed{args.seed}" / "best.pth"
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg["model"]["pretrained"] = False                 # weights come from the checkpoint
     model = build_model(cfg).to(device)
     model.load_state_dict(ckpt["model"])
-    if args.split == "test":
-        dl, recs = build_test_loader(cfg, args.fold)
-    else:
+    if args.split == "val":
         _, dl, recs = build_loaders(cfg, args.fold, args.seed)
-    m = evaluate(model, dl, recs, cfg, device, cfg["train"]["amp"] and device.type == "cuda")
+    else:
+        dl, recs = build_test_loader(cfg, args.fold, args.split)
+    m, preds = evaluate(model, dl, recs, cfg, device, cfg["train"]["amp"] and device.type == "cuda",
+                        return_preds=True)
     row = {"experiment": run_name(cfg), "fold": args.fold, "seed": args.seed,
            "best_epoch": ckpt["epoch"], **{k: float(v) for k, v in m.items()}}
     print(row)
-    print("->", append_row(cfg, row, args.split))
+    if not args.no_csv:
+        print("->", append_row(cfg, row, args.split))
+    if args.samples:
+        from plots import plot_samples
+        out = (resolve_path(cfg["out_dir"]) / "results" / "figures" / f"{run_name(cfg)}_fold{args.fold}_seed{args.seed}"
+               / f"samples_{args.split}.png")
+        print("->", plot_samples(cfg, recs, preds, out, args.samples, args.split, m))
 
 
 if __name__ == "__main__":

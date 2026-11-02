@@ -1,0 +1,10 @@
+# E5: E4's backbone (Swin + ResNet18, late fusion at C2-C5, FPN) with a semantic segmentation head
+# instead of Mask R-CNN. Instances = connected components of the predicted RTS mask (models/seg.py).
+_base_: base.yaml
+name: e5
+experiment: seg_late_fpn
+streams:
+  swin: [red, green, blue, nir]
+  terrain: [relative_elevation, shaded_relief, ndvi]
+flags:
+  ndwi_to_terrain: false            # ablation: terrain gets NDWI as a 4th channel

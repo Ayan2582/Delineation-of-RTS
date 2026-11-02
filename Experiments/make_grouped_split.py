@@ -12,7 +12,7 @@ pixels with another chip), so a random split puts the same ground in train and v
     python make_grouped_split.py                       # -> splits/grouped_folds.json
     python make_grouped_split.py --test_frac 0.15 --n_folds 5 --seed 0
 
-The output keeps folds.json's format (`val_ids` per fold) and adds `test_ids`; data.py drops
+The output holds `val_ids` per fold and `test_ids`; data.py drops
 test ids from every fold's train and val, so the local test chips are never trained on or
 used for checkpoint selection.
 """

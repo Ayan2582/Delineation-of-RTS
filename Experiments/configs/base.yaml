@@ -1,14 +1,19 @@
-# Shared by E1-E4. Anything an experiment may change lives in e*.yaml; everything here is
+# Shared by E1-E6. Anything an experiment may change lives in e*.yaml; everything here is
 # identical across experiments so the comparison is fair.
 data:
   root: ../competition_release        # release folder (train/, metadata/, tools/)
   cache_dir: cache                    # NaN-filled tiles + per-fold stats
   folds_file: splits/grouped_folds.json  # leak-free: overlapping chips grouped + held-out test_ids
-                                         # (make_grouped_split.py); splits/folds.json = old random folds
-  n_folds: 5
-  fold_seed: 0
+                                         # (make_grouped_split.py)
   num_workers: 2
   limit: null                         # debug: use only the first N images
+  swin_norm: zscore                   # zscore = per-band (x - mean) / std; satlas = Swin RGB / 255 as the
+                                      # Satlas weights expect, other Swin bands matched to it (data.input_norm)
+  rgb_ref: null                       # satlas only. null = the chips' RGB is 8-bit (GeoAI); geoai = map the RGB
+                                      # to geoai_rgb's mean/std first (DARTS pretraining: S2 reflectance 0-10000)
+  geoai_rgb:                          # raw GeoAI RGB stats, the 635 train chips outside grouped_folds test_ids
+    mean: [92.384, 95.936, 77.286]
+    std: [37.757, 31.109, 30.866]
 
 aug:
   hflip: 0.5
@@ -19,9 +24,21 @@ aug:
   brightness: 0.2                     # additive shift, in std units (inputs are z-scored)
   contrast: 0.2                       # scale ~ U[1-c, 1+c] about the mean (0)
   jitter_bands: [red, green, blue, nir]   # optical only; never NDVI/NDWI/DEM
+  scale_jitter: null                  # [lo, hi]: resize each chip by s ~ U[lo, hi]; null = off
+  copy_paste_p: 0.0                   # chance per chip of pasting RTS cut from other train chips
+  copy_paste_max: 3                   # pasted instances per chip ~ U{1..max}
+  band_drop_p: 0.0                    # chance per chip of replacing ONE of band_drop_bands by its train mean;
+                                      # 0 = off. Teaches robustness to the NIR/DEM shift of the test sites
+  band_drop_bands: [nir, ndvi, ndwi, relative_elevation, shaded_relief]   # never RGB; absent bands ignored
 
 model:
   pretrained: true                    # Swin_V2_B_Weights.NAIP_RGB_SI_SATLAS
+  optical: swin_v2_b                  # optical-stream network: swin_v2_b (Satlas aerial, 87M) | swin_v2_t
+                                      # (ImageNet, 28M) | resnet50 (23M) | resnet34 (21M) | resnet18 (11M);
+                                      # ImageNet ones need data.swin_norm=zscore. Bands = streams.swin either way
+  freeze_optical: 0                   # optical stages kept fixed (0-4; 4 = whole optical network frozen)
+  input_scale: 1.0                   # chips are upsampled by this inside the model (train and eval);
+                                      # outputs are mapped back to chip size. 1.0 = native resolution
   fpn_channels: 256
   anchor_sizes: [32, 64, 128, 256, 512]
   aspect_ratios: [0.5, 1.0, 2.0]
@@ -33,12 +50,30 @@ model:
   fuse_gn_groups: 32
   terrain_gn_groups: 16
   mask_logits_init_std: null          # null = torchvision default init; 0.001 = detectron2-style
+  ohem: false                         # online hard example mining in the RoI heads (models/ohem.py)
+  ohem_rois: 128                      # with ohem: hardest RoIs kept per image (the random sampler keeps 512)
+  ohem_nms: 0.7                       # with ohem: NMS IoU among candidates before picking; 1.0 = no NMS
+  # E2+gate / E2+boundary / E6 modules; off here, switched on by e2_gate.yaml, e2_boundary.yaml, e6.yaml
+  band_gate: false                    # learned per-image trust in each input band (models/gate.py)
+  band_gate_hidden: 32                # gate MLP width
+  boundary_head: false                # boundary branch fused into the mask predictor (models/boundary.py)
+  boundary_dim: 128                   # boundary branch width
+  boundary_weight: 1.0                # loss_boundary = this * (BCE + Dice) on the RoI outline
+  # E5 (seg_* experiments) only; Mask R-CNN experiments ignore these, E5 ignores anchors/RoI/ohem
+  seg_channels: 128                   # semantic-FPN decoder width
+  seg_thresh: 0.5                     # RTS probability threshold before connected components
+  seg_min_px: 10                      # smaller components are dropped (the labels have none < 10 px)
+  seg_dice_weight: 1.0                # loss = weighted BCE + this * soft Dice
+  seg_gap_w0: 10.0                    # U-Net gap weight on background between two nearby RTS; 0 = off
+  seg_gap_sigma: 5.0                  # px; the gap weight decays with (d1 + d2) on this scale
 
 train:
   epochs: 50
   batch_size: 8
   weight_decay: 0.05
   warmup_epochs: 1
+  eval_every: 1                       # val scored (and best.pth picked) every N epochs and at the last one
+  keep_last: false                    # keep last.pth (weights + optimiser) after the run finishes
   lr:
     swin: 1.0e-4
     terrain: 1.0e-3
@@ -50,4 +85,7 @@ eval:
   score_thresh: 0.5                   # mean-IoU only; COCO AP uses all detections
   mask_thresh: 0.5
 
-out_dir: outputs
+monitor: null                         # DARTS pretraining: {root, cache_dir, folds_file} of GeoAI; its non-test chips
+                                      # are also scored at each val epoch (geoai_* columns), report only
+out_dir: outputs                      # checkpoints + config (runs/), results/ (CSVs, history, figures)
+log_dir: null                         # TensorBoard; null = runs/<exp>/<fold_seed>/tb inside out_dir
