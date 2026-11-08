@@ -1,0 +1,29 @@
+# Full-image RGB Mask R-CNN baseline
+_base_: ../base.yaml
+
+name: maskrcnn_full_rgb
+experiment: single_fpn
+
+data:
+  root: ../..
+  cache_dir: cache
+  folds_file: splits/grouped_folds.json
+  swin_norm: zscore
+
+streams:
+  swin: [red, green, blue]
+  terrain: []
+
+model:
+  optical: resnet50
+  pretrained: true
+  freeze_optical: 0
+  input_scale: 1.0
+  band_gate: false
+  boundary_head: false
+
+train:
+  batch_size: 2
+  epochs: 50
+
+flags: {}
