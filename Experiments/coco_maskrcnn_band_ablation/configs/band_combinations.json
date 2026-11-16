@@ -1,0 +1,22 @@
+[
+  {"id":"C01","name":"RGB","bands":["red","green","blue"]},
+  {"id":"C02","name":"RG_NDVI","bands":["red","green","ndvi"]},
+  {"id":"C03","name":"RB_NDVI","bands":["red","blue","ndvi"]},
+  {"id":"C04","name":"GB_NDVI","bands":["green","blue","ndvi"]},
+  {"id":"C05","name":"RG_NIR","bands":["red","green","nir"]},
+  {"id":"C06","name":"RB_NIR","bands":["red","blue","nir"]},
+  {"id":"C07","name":"GB_NIR","bands":["green","blue","nir"]},
+  {"id":"C08","name":"RG_NDWI","bands":["red","green","ndwi"]},
+  {"id":"C09","name":"RB_NDWI","bands":["red","blue","ndwi"]},
+  {"id":"C10","name":"GB_NDWI","bands":["green","blue","ndwi"]},
+  {"id":"C11","name":"RG_RelElev","bands":["red","green","relative_elevation"]},
+  {"id":"C12","name":"RB_RelElev","bands":["red","blue","relative_elevation"]},
+  {"id":"C13","name":"GB_RelElev","bands":["green","blue","relative_elevation"]},
+  {"id":"C14","name":"RG_ShadedRelief","bands":["red","green","shaded_relief"]},
+  {"id":"C15","name":"RB_ShadedRelief","bands":["red","blue","shaded_relief"]},
+  {"id":"C16","name":"GB_ShadedRelief","bands":["green","blue","shaded_relief"]},
+  {"id":"C17","name":"Spectral","bands":["ndvi","nir","ndwi"]},
+  {"id":"C18","name":"Terrain_Vegetation","bands":["ndvi","relative_elevation","shaded_relief"]},
+  {"id":"C19","name":"Spectral_Terrain","bands":["nir","relative_elevation","ndwi"]},
+  {"id":"C20","name":"Mixed","bands":["ndvi","shaded_relief","ndwi"]}
+]
